@@ -14,7 +14,7 @@ use tracing::info;
 
 use walgit_config::Config;
 use walgit_git::{IngestOptions, ObjectFormat};
-use walgit_store::open_store;
+use walgit_store::StoreFactory;
 use walgit_wal::Registry;
 
 use crate::cli::parse_repo_id;
@@ -77,6 +77,7 @@ pub async fn run(
     reuse_packs: bool,
     refs: Vec<String>,
     cfg: &Arc<Config>,
+    stores: &Arc<dyn StoreFactory>,
 ) -> Result<()> {
     let (owner, name) = parse_repo_id(&repo)?;
     let id = walgit_git::RepoId::new(owner, name)?;
@@ -90,7 +91,7 @@ pub async fn run(
     info!(format = ?format, "object format");
 
     // Open the store and create the repo.
-    let store = open_store(cfg).await?;
+    let store = stores.open(cfg).await?;
     std::fs::create_dir_all(&cfg.cache.dir).ok();
     let registry = Registry::new(store, cfg.clone());
 

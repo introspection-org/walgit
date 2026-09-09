@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use walgit_config::Config;
 use walgit_server::ops::{CompactRequest, compact_repo};
-use walgit_store::open_store;
+use walgit_store::StoreFactory;
 use walgit_wal::Registry;
 
 use crate::cli::parse_repo_id;
@@ -20,12 +20,13 @@ pub async fn run(
     once: bool,
     base: bool,
     cfg: &Arc<Config>,
+    stores: &Arc<dyn StoreFactory>,
 ) -> Result<()> {
     if !cfg.compaction.enabled {
         bail!("compaction is disabled in config");
     }
 
-    let store = open_store(cfg).await?;
+    let store = stores.open(cfg).await?;
     std::fs::create_dir_all(&cfg.cache.dir).ok();
     let registry = Registry::new(store, cfg.clone());
 

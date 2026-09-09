@@ -23,11 +23,11 @@ use tracing::{info, warn};
 
 use walgit_config::{Config, Role};
 use walgit_server::{AppState, serve};
-use walgit_store::open_store;
+use walgit_store::StoreFactory;
 
-pub async fn run(cfg: &Arc<Config>) -> Result<()> {
+pub async fn run(cfg: &Arc<Config>, stores: &Arc<dyn StoreFactory>) -> Result<()> {
     info!(backend = ?cfg.store.backend, "opening store");
-    let store = open_store(cfg).await?;
+    let store = stores.open(cfg).await?;
     info!(backend = store.backend(), "store ready");
 
     // Ensure the cache directory exists.

@@ -8,18 +8,22 @@ use tracing::info;
 
 use walgit_bundle::Bundler;
 use walgit_config::Config;
-use walgit_store::open_store;
+use walgit_store::StoreFactory;
 use walgit_wal::Registry;
 
 use crate::BundleAction;
 use crate::cli::parse_repo_id;
 
-pub async fn run(action: BundleAction, cfg: &Arc<Config>) -> Result<()> {
+pub async fn run(
+    action: BundleAction,
+    cfg: &Arc<Config>,
+    stores: &Arc<dyn StoreFactory>,
+) -> Result<()> {
     if !cfg.bundles.enabled {
         bail!("bundles are disabled in config");
     }
 
-    let store = open_store(cfg).await?;
+    let store = stores.open(cfg).await?;
     let store_root = store.clone();
     std::fs::create_dir_all(&cfg.cache.dir).ok();
     let registry = Registry::new(store, cfg.clone());

@@ -32,7 +32,7 @@ use walgit_proto::v1::{
 };
 use walgit_proto::{WAL_FORMAT_VERSION, time};
 use walgit_store::{
-    ObjectStore, ObjectStoreExt, Prefixed, PutBody, PutMode, PutOptions, StoreError, open_store,
+    ObjectStore, ObjectStoreExt, Prefixed, PutBody, PutMode, PutOptions, StoreError, StoreFactory,
 };
 
 use crate::cli::parse_repo_id;
@@ -270,8 +270,13 @@ pub fn decide_resume(
     ResumeDecision::Resume
 }
 
-pub async fn run(opts: DirectOptions, cfg: &Arc<Config>, force: bool) -> Result<()> {
-    let store = open_store(cfg).await?;
+pub async fn run(
+    opts: DirectOptions,
+    cfg: &Arc<Config>,
+    force: bool,
+    stores: &Arc<dyn StoreFactory>,
+) -> Result<()> {
+    let store = stores.open(cfg).await?;
     let report = run_with_store(opts, cfg, store, force).await?;
     println!(
         "import: seq {}, {} object(s) uploaded, {} skipped, {} manifest write(s){}{}",

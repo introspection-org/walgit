@@ -21,13 +21,18 @@
 //! when `WALGIT_TEST_S3_ENDPOINT` is set. `GcsStore` is tested when
 //! `WALGIT_TEST_GCS_BUCKET` is set (`StoreGcs` adds that wrapper).
 
+mod support;
+
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use futures::StreamExt;
 use walgit_store::{
-    DynStore, GetOptions, GetResult, PutBody, PutMode, PutOptions, StoreError, memory::MemoryStore,
+    DynStore, GetOptions, GetResult, ObjectStore, PutBody, PutMode, PutOptions, StoreError,
+    encrypted::{self, EncryptedStore},
+    memory::MemoryStore,
 };
 
 /// Run the full contract suite against `store` under `prefix`.
@@ -922,5 +927,234 @@ async fn gcs_control_plane_not_starved_by_bulk() {
     assert!(
         worst < std::time::Duration::from_secs(2),
         "a control-plane call took {worst:?} under bulk load"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Application-level encryption: does an encrypting decorator satisfy this same
+// contract, and what does it cost. See docs on `support::encrypted`.
+// ---------------------------------------------------------------------------
+
+/// The container's chunk size must equal `walgit_wal::remote::BLOCK_SIZE`. At that
+/// equality one plaintext block is exactly one ciphertext chunk and a pack range
+/// read amplifies by nothing; at any other value every 1 MiB read straddles chunks.
+/// walgit-store does not depend on walgit-wal, so this pins the constant by value.
+#[test]
+fn chunk_size_matches_block_size() {
+    assert_eq!(encrypted::CHUNK, 1024 * 1024);
+}
+
+/// The whole point: the encrypting decorator is driven through the same suite as
+/// every real backend, unchanged. Range boundaries, CAS, conditional GET, delete
+/// and listing all have to behave identically through the container.
+#[tokio::test]
+async fn encrypted_memory_contract() {
+    let store = EncryptedStore::new(
+        Arc::new(MemoryStore::new()),
+        support::encrypted::ExampleAesGcmCodec::new([0x42; 32]),
+    );
+    run_contract(store, "enc").await;
+}
+
+/// A chunk moved to another object must not open, even though both were sealed
+/// under the same key. This is what makes the AAD binding load-bearing rather
+/// than decorative, and it is not something `run_contract` can observe.
+#[tokio::test]
+async fn encrypted_rejects_cross_object_substitution() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let store = EncryptedStore::new(
+        inner.clone(),
+        support::encrypted::ExampleAesGcmCodec::new([0x42; 32]),
+    );
+    let body = Bytes::from(vec![7u8; 4096]);
+    store
+        .put("a", PutBody::Bytes(body.clone()), PutOptions::default())
+        .await
+        .unwrap();
+    store
+        .put("b", PutBody::Bytes(body), PutOptions::default())
+        .await
+        .unwrap();
+
+    // Move a's sealed container under b's name, bypassing the decorator.
+    let (_, sealed_a) = inner
+        .get("a", GetOptions::default())
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .unwrap();
+    inner
+        .put("b", PutBody::Bytes(sealed_a), PutOptions::default())
+        .await
+        .unwrap();
+
+    let err = store.get("b", GetOptions::default()).await;
+    let failed = match err {
+        Err(_) => true,
+        Ok(r) => r.bytes().await.is_err(),
+    };
+    assert!(
+        failed,
+        "a container moved between objects must fail authentication"
+    );
+}
+
+/// What application-level encryption costs, reported rather than asserted: a
+/// throughput floor is profile-dependent, not a property, and would be a flaky
+/// gate. The correctness of the container is covered by the two tests above,
+/// which do run in CI.
+///
+/// `just test-slow` runs this, but the numbers are only meaningful with
+/// `--release`: `[profile.dev]` builds workspace crates at opt-level 0 while
+/// dependencies get opt-level 2, so a debug run measures the container's buffer
+/// handling unoptimized against an optimized cipher and reads ~50x low.
+///
+/// ```sh
+/// cargo test --release -p walgit-store --test contract -- --ignored --nocapture
+/// ```
+#[ignore = "throughput benchmark; run in test-slow tier with --release"]
+#[tokio::test]
+async fn encrypted_overhead_report() {
+    const OBJ: usize = 16 * 1024 * 1024;
+    let store = EncryptedStore::new(
+        Arc::new(MemoryStore::new()),
+        support::encrypted::ExampleAesGcmCodec::new([0x42; 32]),
+    );
+
+    let mut plain = vec![0u8; OBJ];
+    let mut st: u64 = 0x9e37_79b9_7f4a_7c15;
+    for b in &mut plain {
+        st = st
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *b = (st >> 33) as u8;
+    }
+    let plain = Bytes::from(plain);
+    let gbps = |bytes: usize, secs: f64| bytes as f64 / secs / 1e9;
+
+    let mut put_best = 0.0f64;
+    for r in 0..4 {
+        let t = Instant::now();
+        store
+            .put("pack", PutBody::Bytes(plain.clone()), PutOptions::default())
+            .await
+            .unwrap();
+        let g = gbps(OBJ, t.elapsed().as_secs_f64());
+        if r > 0 && g > put_best {
+            put_best = g;
+        }
+    }
+
+    // walgit's real read shape: BLOCK_SIZE-aligned ranges (`remote.rs::read_at`).
+    let blocks = OBJ / encrypted::CHUNK;
+    let mut aligned_best = 0.0f64;
+    for r in 0..4 {
+        let t = Instant::now();
+        for n in 0..blocks {
+            let off = (n * encrypted::CHUNK) as u64;
+            let g = store
+                .get(
+                    "pack",
+                    GetOptions {
+                        range: Some(off..off + encrypted::CHUNK as u64),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let (_, b) = g.bytes().await.unwrap().unwrap();
+            assert_eq!(b.len(), encrypted::CHUNK);
+        }
+        let g = gbps(blocks * encrypted::CHUNK, t.elapsed().as_secs_f64());
+        if r > 0 && g > aligned_best {
+            aligned_best = g;
+        }
+    }
+
+    if cfg!(debug_assertions) {
+        println!("WARNING: debug profile — these numbers are not meaningful, rerun with --release");
+    }
+    println!("encrypted put                {put_best:6.2} GB/s");
+    println!("encrypted get, 1 MiB aligned {aligned_best:6.2} GB/s  <- walgit's read shape");
+}
+
+/// Batching is the property that decides whether a codec can be backed by a
+/// network service, so it is asserted rather than assumed: a range spanning N
+/// blocks must reach the codec as ONE call carrying N chunks, and a whole-object
+/// write likewise. A per-chunk codec call would mean a round trip per megabyte.
+#[tokio::test]
+async fn codec_receives_whole_batches_not_one_call_per_chunk() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingCodec {
+        inner: support::encrypted::ExampleAesGcmCodec,
+        calls: Arc<AtomicUsize>,
+        chunks: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl encrypted::ChunkCodec for CountingCodec {
+        fn overhead_per_chunk(&self) -> usize {
+            self.inner.overhead_per_chunk()
+        }
+        async fn begin_write(&self, object: &str) -> anyhow::Result<Vec<u8>> {
+            self.inner.begin_write(object).await
+        }
+        async fn seal(
+            &self,
+            object: &str,
+            header: &[u8],
+            batch: &mut [encrypted::Chunk<'_>],
+        ) -> anyhow::Result<()> {
+            self.inner.seal(object, header, batch).await
+        }
+        async fn open(
+            &self,
+            object: &str,
+            header: &[u8],
+            batch: &mut [encrypted::Chunk<'_>],
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.chunks.fetch_add(batch.len(), Ordering::Relaxed);
+            self.inner.open(object, header, batch).await
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let chunks = Arc::new(AtomicUsize::new(0));
+    let store = EncryptedStore::new(
+        Arc::new(MemoryStore::new()),
+        CountingCodec {
+            inner: support::encrypted::ExampleAesGcmCodec::new([0x42; 32]),
+            calls: calls.clone(),
+            chunks: chunks.clone(),
+        },
+    );
+
+    // Four chunks; read a range that spans all of them.
+    let size = 4 * encrypted::CHUNK;
+    store
+        .put(
+            "pack",
+            PutBody::Bytes(Bytes::from(vec![9u8; size])),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let r = store.get("pack", GetOptions::default()).await.unwrap();
+    let (_, body) = r.bytes().await.unwrap().unwrap();
+    assert_eq!(body.len(), size);
+
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "a 4-chunk range must be one codec call"
+    );
+    assert_eq!(
+        chunks.load(Ordering::Relaxed),
+        4,
+        "all four chunks must arrive in that call"
     );
 }

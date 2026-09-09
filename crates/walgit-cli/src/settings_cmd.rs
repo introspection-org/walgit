@@ -3,14 +3,18 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use walgit_config::Config;
-use walgit_store::open_store;
+use walgit_store::StoreFactory;
 use walgit_wal::Registry;
 
 use crate::SettingsAction;
 use crate::cli::parse_repo_id;
 
-pub async fn run(action: SettingsAction, cfg: &Arc<Config>) -> Result<()> {
-    let store = open_store(cfg).await?;
+pub async fn run(
+    action: SettingsAction,
+    cfg: &Arc<Config>,
+    stores: &Arc<dyn StoreFactory>,
+) -> Result<()> {
+    let store = stores.open(cfg).await?;
     std::fs::create_dir_all(&cfg.cache.dir).ok();
     let registry = Registry::new(store, cfg.clone());
     let author = std::env::var("USER").unwrap_or_else(|_| "cli".into());

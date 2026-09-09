@@ -7,19 +7,23 @@ use tracing::info;
 
 use walgit_config::Config;
 use walgit_git::ObjectFormat;
-use walgit_store::open_store;
+use walgit_store::StoreFactory;
 use walgit_wal::Registry;
 
 use crate::cli::{parse_repo_id, println_kv};
 use crate::{PolicyAction, RepoAction};
 
-pub async fn run(action: RepoAction, cfg: &Arc<Config>) -> Result<()> {
-    let store = open_store(cfg).await?;
+pub async fn run(
+    action: RepoAction,
+    cfg: &Arc<Config>,
+    stores: &Arc<dyn StoreFactory>,
+) -> Result<()> {
+    let store = stores.open(cfg).await?;
     std::fs::create_dir_all(&cfg.cache.dir).ok();
     let registry = Registry::new(store.clone(), cfg.clone());
 
     if let RepoAction::Settings { action } = action {
-        return crate::settings_cmd::run(action, cfg).await;
+        return crate::settings_cmd::run(action, cfg, stores).await;
     }
     match action {
         RepoAction::Create {

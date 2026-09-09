@@ -17,6 +17,7 @@ use futures::Stream;
 use tracing::Instrument;
 
 pub mod coord;
+pub mod encrypted;
 pub use coord::CoordError;
 pub mod fault;
 #[cfg(feature = "gcs")]
@@ -625,6 +626,31 @@ impl ObjectStore for Prefixed {
             .compose(&self.full(dest), &full_sources, opts)
             .await?;
         Ok(self.strip(meta))
+    }
+}
+
+/// How a binary obtains its store. `walgit serve`, the maintenance loops and every
+/// storage-using command resolve their store through one of these, so a downstream
+/// build can wrap the backend (encryption, instrumentation) without the commands
+/// knowing. Called once per command, after config validation and before any store
+/// access; a failure stops startup rather than falling back to the raw backend.
+///
+/// An adapter that wraps [`open_store`] sees logical keys *before* the configured
+/// global prefix is applied. If its integrity scheme needs bucket/prefix identity it
+/// must take a separately supplied, stable identifier rather than deriving one from
+/// wrapper order — or construct backend, adapter and [`Prefixed`] itself.
+#[async_trait::async_trait]
+pub trait StoreFactory: Send + Sync + 'static {
+    async fn open(&self, cfg: &walgit_config::Config) -> anyhow::Result<DynStore>;
+}
+
+/// The stock behaviour: exactly [`open_store`]. What `walgit` and `walgit-server` use.
+pub struct DefaultStoreFactory;
+
+#[async_trait::async_trait]
+impl StoreFactory for DefaultStoreFactory {
+    async fn open(&self, cfg: &walgit_config::Config) -> anyhow::Result<DynStore> {
+        open_store(cfg).await
     }
 }
 

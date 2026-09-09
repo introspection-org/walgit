@@ -481,15 +481,39 @@ fn load_config(path: &std::path::Path) -> Config {
 
 pub fn main() -> Result<()> {
     let cli = Cli::parse();
-    run(&cli.config, cli.command.unwrap_or(Command::Serve))
+    run(
+        &cli.config,
+        cli.command.unwrap_or(Command::Serve),
+        std::sync::Arc::new(walgit_store::DefaultStoreFactory),
+    )
 }
 
 pub fn main_server() -> Result<()> {
     let cli = ServerCli::parse();
-    run(&cli.config, Command::Serve)
+    run(
+        &cli.config,
+        Command::Serve,
+        std::sync::Arc::new(walgit_store::DefaultStoreFactory),
+    )
 }
 
-fn run(config: &std::path::Path, command: Command) -> Result<()> {
+/// `main` with the store supplied by the caller. A downstream binary reuses every
+/// command and both serving and maintenance roles while resolving its own store —
+/// the one seam an external adapter needs, since each command would otherwise open
+/// the raw backend itself.
+pub fn run_with_store_factory(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    factory: std::sync::Arc<dyn walgit_store::StoreFactory>,
+) -> Result<()> {
+    let cli = Cli::parse_from(args);
+    run(&cli.config, cli.command.unwrap_or(Command::Serve), factory)
+}
+
+fn run(
+    config: &std::path::Path,
+    command: Command,
+    stores: std::sync::Arc<dyn walgit_store::StoreFactory>,
+) -> Result<()> {
     // Install the rustls crypto provider before any TLS code runs (GCS gRPC, reqwest).
     // Required for rustls 0.23+ — multiple providers in the dep tree; select one.
     rustls::crypto::aws_lc_rs::default_provider()
@@ -503,10 +527,14 @@ fn run(config: &std::path::Path, command: Command) -> Result<()> {
         .enable_all()
         .build()?;
 
-    rt.block_on(async move { dispatch(command, cfg).await })
+    rt.block_on(async move { dispatch(command, cfg, stores).await })
 }
 
-async fn dispatch(command: Command, cfg: Config) -> Result<()> {
+async fn dispatch(
+    command: Command,
+    cfg: Config,
+    stores: std::sync::Arc<dyn walgit_store::StoreFactory>,
+) -> Result<()> {
     let cfg = std::sync::Arc::new(cfg);
     match command {
         Command::Config { action } => config_cmd::run(action, &cfg).await,
@@ -517,16 +545,16 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
             files,
             seed,
         } => synth::run(out, size, commits, files, seed).await,
-        Command::Serve => serve::run(&cfg).await,
+        Command::Serve => serve::run(&cfg, &stores).await,
         Command::Compact {
             repo,
             all,
             once,
             base,
-        } => compact::run(repo, all, once, base, &cfg).await,
-        Command::Bundle { action } => bundle_cmd::run(action, &cfg).await,
-        Command::Repo { action } => repo::run(action, &cfg).await,
-        Command::Wal { action } => wal_cmd::run(action, &cfg).await,
+        } => compact::run(repo, all, once, base, &cfg, &stores).await,
+        Command::Bundle { action } => bundle_cmd::run(action, &cfg, &stores).await,
+        Command::Repo { action } => repo::run(action, &cfg, &stores).await,
+        Command::Wal { action } => wal_cmd::run(action, &cfg, &stores).await,
         Command::Mirror {
             from,
             to,
@@ -584,10 +612,11 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
                     },
                     &cfg,
                     force,
+                    &stores,
                 )
                 .await
             } else {
-                import::run(from, repo, reuse_packs, refs, &cfg).await
+                import::run(from, repo, reuse_packs, refs, &cfg, &stores).await
             }
         }
     }

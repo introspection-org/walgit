@@ -74,6 +74,37 @@ The ratio tracks **file size ÷ chunk size**. A file of only a few chunks has to
 gain much; the benefit arrives once a file is tens of chunks. That is the single best predictor of
 whether a workload benefits.
 
+## 3a. GenAI conversations: the time dimension, not the corpus dimension (`--bin conversations`)
+
+A corpus of long-running agent conversations shares a head — system prompt, tool definitions, agent
+metadata — and diverges into unique turns. That sharing does **not** pay off:
+
+| shared head | cross-conversation ratio |
+|---|---:|
+| 8 KiB | 1.00× |
+| 32 KiB | 1.00× |
+| 64 KiB | 1.40× |
+| 512 KiB | 4.60× |
+
+⚠️ **A shared region smaller than one chunk dedups at zero.** An 8–32 KiB prompt is swallowed into the
+first chunk together with unique turn content, so that chunk differs per conversation. Real system
+prompts sit squarely in that dead zone.
+
+Shrinking the chunk target recovers some of it, but the ceiling is the shared *fraction*: 16 KiB
+shared inside a 136 KiB conversation caps at 1.13× however it is chunked.
+
+| chunk target | ratio | chunk metadata |
+|---|---:|---:|
+| 64 KiB | 1.00× | 0.03 MiB |
+| 8 KiB | 1.01× | 0.16 MiB |
+| 2 KiB | 1.12× | 0.57 MiB |
+
+2 KiB chunks capture nearly the whole ceiling for 20× the metadata — a bad trade for 12%.
+
+**The value for conversations is over time, not across the corpus.** One conversation rewritten or
+appended each turn is the ATIF row above: 19× at 2.4 MiB, 69.9× at 9.5 MiB. Deduping a corpus of
+independent conversations against each other is worth approximately nothing.
+
 ## 4. The library is pluggable in both directions
 
 Neither path requires Hugging Face infrastructure:

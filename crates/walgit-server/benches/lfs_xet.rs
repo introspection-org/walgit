@@ -217,14 +217,20 @@ fn main() {
                 mib(r.logical) / r.write_secs.max(1e-9),
             );
         }
+        // CPU comes from /proc in 10 ms ticks, so a ratio over a base under one
+        // tick is noise.
+        let cpu = if whole.cpu_secs < 0.01 {
+            "n/a (base under one 10 ms tick)".to_owned()
+        } else {
+            format!("{:+.0}%", 100.0 * (xet.cpu_secs / whole.cpu_secs - 1.0))
+        };
         println!(
-            "{:<8} {:<6} stored {:.1}x smaller, write {:+.0}%, read {:+.0}%, cpu {:+.0}%\n",
+            "{:<8} {:<6} stored {:.1}x smaller, write {:+.0}%, read {:+.0}%, cpu {cpu}\n",
             "",
             "delta",
             whole.stored as f64 / xet.stored.max(1) as f64,
             100.0 * (xet.write_secs / whole.write_secs.max(1e-9) - 1.0),
             100.0 * (xet.read_secs / whole.read_secs.max(1e-9) - 1.0),
-            100.0 * (xet.cpu_secs / whole.cpu_secs.max(1e-9) - 1.0),
         );
     }
 }

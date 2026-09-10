@@ -129,6 +129,12 @@ fn peak_rss_mib() -> f64 {
     vm_hwm_mib("/proc/self/status")
 }
 
+/// VmHWM is a process-lifetime high-water mark; writing 5 to clear_refs resets
+/// it so each run reports its own peak rather than the largest so far.
+fn reset_peak_rss() {
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+}
+
 async fn stored_bytes(store: &DynStore) -> u64 {
     let mut total = 0;
     let mut s = store.list("", None);
@@ -153,6 +159,7 @@ struct Run {
 }
 
 async fn run_whole(series: &[Bytes]) -> Run {
+    reset_peak_rss();
     let store: DynStore = Arc::new(MemoryStore::new());
     let mut run = Run::default();
     let mut keys: Vec<String> = Vec::with_capacity(series.len());
@@ -184,6 +191,7 @@ async fn run_whole(series: &[Bytes]) -> Run {
 }
 
 async fn run_xet(series: &[Bytes]) -> Run {
+    reset_peak_rss();
     let store: DynStore = Arc::new(MemoryStore::new());
     let xet = lfs_xet::Xet::new(Arc::clone(&store));
     let mut run = Run::default();
@@ -354,7 +362,7 @@ fn main() {
         // (name, lines per revision, bytes per line) -> final file of roughly the named size.
         for (tier, per_rev, line_bytes) in [("small", 40, 512), ("medium", 200, 1024), ("large", 400, 2048)] {
             let series = revisions(shape, 7, revs, per_rev, line_bytes);
-            let final_size = series.last().map(|b| b.len()).unwrap_or(0) as u64;
+            let final_size = series.last().map_or(0, Bytes::len) as u64;
 
             let whole = avg((0..iters).map(|_| rt.block_on(run_whole(&series))).collect());
             let xet = avg((0..iters).map(|_| rt.block_on(run_xet(&series))).collect());

@@ -402,6 +402,12 @@ decision in §4 — or the PR is; never "fix later".
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 
+- **D42 (2026-09-09)** Optional storage plugins use a versioned C boundary and
+  decorate the one CLI store constructor. Core contains no encryption/provider
+  policy; the example is pass-through. All storage roles share the decorator,
+  failures are fatal, and bucket mounts cannot bypass it. See
+  `docs/STORAGE_PLUGINS.md` for the lifetime and compatibility contract.
+
 ---
 
 ## 5. Working rules

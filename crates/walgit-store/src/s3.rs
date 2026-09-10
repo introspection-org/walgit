@@ -71,9 +71,10 @@ impl S3Store {
     ///
     /// The env vars named in `cfg.s3.access_key_env` / `cfg.s3.secret_key_env`
     /// (defaults `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) override, plus
-    /// `AWS_SESSION_TOKEN` when present. Without both, the AWS default chain
-    /// resolves the credential, which is what reaches a role assumed from a
-    /// projected service-account token (IRSA) rather than a stored key.
+    /// `AWS_SESSION_TOKEN` when present. When both key variables are unset,
+    /// the AWS default chain resolves and refreshes credentials (including
+    /// projected service-account tokens / IRSA). A partial or empty explicit
+    /// key pair is an error, not a fallback to another identity.
     pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
         let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
 
@@ -83,21 +84,29 @@ impl S3Store {
             .behavior_version_latest();
 
         s3_config = match (
-            std::env::var(&cfg.s3.access_key_env).ok(),
-            std::env::var(&cfg.s3.secret_key_env).ok(),
+            std::env::var(&cfg.s3.access_key_env),
+            std::env::var(&cfg.s3.secret_key_env),
         ) {
-            (Some(access_key), Some(secret_key)) => s3_config.credentials_provider(
-                static_credentials(
+            (Ok(access_key), Ok(secret_key))
+                if !access_key.is_empty() && !secret_key.is_empty() =>
+            {
+                s3_config.credentials_provider(static_credentials(
                     &access_key,
                     &secret_key,
                     std::env::var("AWS_SESSION_TOKEN").ok(),
+                ))
+            }
+            (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => s3_config
+                .credentials_provider(
+                    aws_config::default_provider::credentials::DefaultCredentialsChain::builder()
+                        .region(region)
+                        .build()
+                        .await,
                 ),
-            ),
-            _ => s3_config.credentials_provider(
-                aws_config::default_provider::credentials::DefaultCredentialsChain::builder()
-                    .region(region)
-                    .build()
-                    .await,
+            _ => anyhow::bail!(
+                "set both {} and {} to non-empty credentials, or leave both unset for the AWS default credential chain",
+                cfg.s3.access_key_env,
+                cfg.s3.secret_key_env,
             ),
         };
 

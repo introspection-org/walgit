@@ -10,6 +10,9 @@ members = [
     "crates/walgit-bundle",
     "crates/walgit-cli",
 ]
+# Pulls the Hugging Face Xet stack; kept out of the workspace so the normal
+# build never resolves it. See docs/XET.md.
+exclude = ["bench/xet-eval"]
 
 [workspace.package]
 version = "0.1.0"

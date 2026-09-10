@@ -48,16 +48,22 @@ macro_rules! export_plugin {
         #[abi_stable::export_root_module]
         pub fn get_library() -> $crate::abi::PluginRef {
             use $crate::abi_stable::prefix_type::PrefixTypeTrait;
-            extern "C" fn create(
-                inner: $crate::abi::Store,
-                config: $crate::abi_stable::std_types::RVec<u8>,
-            ) -> $crate::abi_stable::std_types::RResult<
-                $crate::abi::Store,
-                $crate::abi_stable::std_types::RString,
-            > {
-                $crate::export(inner, config, $factory)
+            struct Factory;
+            impl Factory {
+                extern "C" fn create(
+                    inner: $crate::abi::Store,
+                    config: $crate::abi_stable::std_types::RVec<u8>,
+                ) -> $crate::abi_stable::std_types::RResult<
+                    $crate::abi::Store,
+                    $crate::abi_stable::std_types::RString,
+                > {
+                    $crate::export(inner, config, $factory)
+                }
             }
-            $crate::abi::Plugin { create }.leak_into_prefix()
+            $crate::abi::Plugin {
+                create: Factory::create,
+            }
+            .leak_into_prefix()
         }
     };
 }

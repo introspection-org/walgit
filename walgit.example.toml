@@ -72,6 +72,11 @@ max_retries = 8                   # retries on retryable store errors (jittered 
 multipart_threshold = "64MiB"     # PUTs above this use multipart/resumable uploads
 multipart_part_size = "32MiB"
 
+# Optional trusted ObjectStore decorator, loaded by every storage-using command.
+# [store.plugin]
+# library = "/usr/local/lib/walgit/libwalgit_store_passthrough.so"
+# options = {} # plugin-owned options; never put plaintext credentials here
+
 [store.s3]
 endpoint = "https://s3.us-east-1.amazonaws.com"   # or http://127.0.0.1:9000 for rustfs/MinIO
 region = "us-east-1"

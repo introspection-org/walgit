@@ -1,10 +1,9 @@
-#![allow(unsafe_code)]
-
-use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
+use abi_stable::sabi_trait::TD_Opaque;
+use abi_stable::std_types::{ROption, RResult, RString, RVec};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use serde::Serialize;
@@ -14,59 +13,30 @@ use walgit_store::{
     PutBody, PutOptions, Result, StoreError, Version,
 };
 
-use crate::abi::{self, Buffer, Reply, Request, Slice};
+use crate::abi::{self, Reply, StoreApi, StreamApi};
 use crate::wire::{Accel, Meta, Operation, ReadResult, WireError, put_options};
 
-fn json(value: &impl Serialize) -> Result<Buffer> {
+fn json(value: &impl Serialize) -> Result<RVec<u8>> {
     let bytes = serde_json::to_vec(value).map_err(StoreError::other)?;
     if bytes.len() > abi::MAX_METADATA {
         return Err(StoreError::InvalidArgument(
             "plugin metadata exceeds limit".into(),
         ));
     }
-    Ok(abi::own_buffer(bytes))
+    Ok(bytes.into())
 }
-
-fn error_reply(error: StoreError) -> Reply {
-    let error = WireError::from(error);
-    let bytes = serde_json::to_vec(&error)
-        .unwrap_or_else(|_| br#"{"error":"other","message":"plugin failure"}"#.to_vec());
-    Reply {
-        status: -1,
-        metadata: abi::own_buffer(bytes),
-        body: abi::Stream::default(),
-    }
+fn wire_error(error: StoreError) -> RString {
+    serde_json::to_string(&WireError::from(error))
+        .unwrap_or_else(|_| r#"{"error":"other","message":"plugin failure"}"#.into())
+        .into()
 }
-
-pub fn error_text(buffer: &Buffer) -> String {
-    // SAFETY: A live V1 buffer owns len readable bytes until it is dropped.
-    match unsafe {
-        abi::read_slice(
-            Slice {
-                ptr: buffer.ptr,
-                len: buffer.len,
-            },
-            abi::MAX_METADATA,
-        )
-    } {
-        Ok(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        Err(_) => "invalid error response".into(),
+fn decode<T: serde::de::DeserializeOwned>(buffer: &[u8]) -> Result<T> {
+    if buffer.len() > abi::MAX_METADATA {
+        return Err(StoreError::InvalidArgument(
+            "plugin metadata exceeds limit".into(),
+        ));
     }
-}
-
-fn decode<T: serde::de::DeserializeOwned>(buffer: &Buffer) -> Result<T> {
-    // SAFETY: A live V1 buffer owns len readable bytes until drop.
-    let bytes = unsafe {
-        abi::read_slice(
-            Slice {
-                ptr: buffer.ptr,
-                len: buffer.len,
-            },
-            abi::MAX_METADATA,
-        )
-    }
-    .map_err(StoreError::other)?;
-    serde_json::from_slice(bytes).map_err(StoreError::other)
+    serde_json::from_slice(buffer).map_err(StoreError::other)
 }
 
 struct StreamState {
@@ -74,96 +44,63 @@ struct StreamState {
     pending: Bytes,
     runtime: Handle,
 }
-
+impl StreamApi for StreamState {
+    fn poll(&mut self) -> RResult<ROption<RVec<u8>>, RString> {
+        match catch_unwind(AssertUnwindSafe(|| {
+            if self.pending.is_empty() {
+                match self.runtime.block_on(self.body.next()) {
+                    Some(Ok(bytes)) => self.pending = bytes,
+                    Some(Err(error)) => return Err(error),
+                    None => return Ok(ROption::RNone),
+                }
+            }
+            let size = self.pending.len().min(abi::MAX_FRAME);
+            Ok(ROption::RSome(self.pending.split_to(size).to_vec().into()))
+        })) {
+            Ok(result) => result.map_err(wire_error).into(),
+            Err(_) => RResult::RErr(wire_error(StoreError::other(anyhow::anyhow!(
+                "plugin stream panicked"
+            )))),
+        }
+    }
+}
 fn expose_stream(body: ByteStream, runtime: Handle) -> abi::Stream {
-    abi::Stream {
-        context: Box::into_raw(Box::new(StreamState {
+    ROption::RSome(abi::StreamApi_TO::from_value(
+        StreamState {
             body,
             pending: Bytes::new(),
             runtime,
-        }))
-        .cast(),
-        next: Some(next_stream),
-        release: Some(release_stream),
-    }
+        },
+        TD_Opaque,
+    ))
 }
 
-unsafe extern "C" fn next_stream(context: *mut c_void, out: *mut Buffer) -> i32 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: Context was allocated in expose_stream; polling is exclusive.
-        let state = unsafe { &mut *context.cast::<StreamState>() };
-        if state.pending.is_empty() {
-            match state.runtime.block_on(state.body.next()) {
-                Some(Ok(bytes)) => state.pending = bytes,
-                Some(Err(e)) => return Err(e),
-                None => return Ok(None),
-            }
-        }
-        let size = state.pending.len().min(abi::MAX_FRAME);
-        Ok(Some(state.pending.split_to(size).to_vec()))
-    }));
-    let (code, buffer) = match result {
-        Ok(Ok(Some(bytes))) => (1, abi::own_buffer(bytes)),
-        Ok(Ok(None)) => (0, Buffer::default()),
-        Ok(Err(e)) => (-1, error_reply(e).metadata),
-        Err(_) => (
-            -1,
-            error_reply(StoreError::other(anyhow::anyhow!("plugin stream panicked"))).metadata,
-        ),
-    };
-    // SAFETY: V1 caller supplies a writable, uninitialized output Buffer.
-    unsafe { out.write(buffer) };
-    code
-}
-
-unsafe extern "C" fn release_stream(context: *mut c_void) {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: Stream handle owns this allocation, with no poll in flight.
-        drop(unsafe { Box::from_raw(context.cast::<StreamState>()) });
-    }));
-}
-
-struct Endpoint(abi::Store);
-impl Drop for Endpoint {
-    fn drop(&mut self) {
-        // SAFETY: Arc guarantees no calls or streams using the endpoint remain.
-        unsafe { (self.0.release)(self.0.context) };
-    }
-}
-
-// Holding endpoint keeps the producing store/runtime alive until stream release.
-fn receive_stream(stream: abi::Stream, endpoint: Option<Arc<Endpoint>>) -> ByteStream {
+// RVec keeps its allocator's checked destruction machinery. Bytes holds that
+// owner without copying the returned frame into a second Rust allocation.
+fn receive_stream(stream: abi::Stream, endpoint: Option<Arc<abi::Store>>) -> ByteStream {
     Box::pin(futures::stream::try_unfold(
         (stream, endpoint),
         |(stream, endpoint)| async move {
             tokio::task::spawn_blocking(move || {
-                let Some(next) = stream.next else {
+                let Some(mut stream) = stream.into_option() else {
                     return Ok(None);
                 };
-                let mut buffer = Buffer::default();
-                // SAFETY: The stream is owned, polled serially, and out is writable.
-                let code = unsafe { next(stream.context, &raw mut buffer) };
-                match code {
-                    0 => Ok(None),
-                    1 => {
-                        // SAFETY: The returned buffer lives through this copy.
-                        let bytes = unsafe {
-                            abi::read_slice(
-                                Slice {
-                                    ptr: buffer.ptr,
-                                    len: buffer.len,
-                                },
-                                abi::MAX_FRAME,
-                            )
-                        }
-                        .map_err(StoreError::other)?;
-                        Ok(Some((Bytes::copy_from_slice(bytes), (stream, endpoint))))
-                    }
-                    -1 => Err(StoreError::from(decode::<WireError>(&buffer)?)),
-                    _ => Err(StoreError::other(anyhow::anyhow!(
-                        "invalid plugin stream status"
-                    ))),
+                let frame = stream.poll().into_result().map_err(|error| {
+                    decode::<WireError>(error.as_bytes())
+                        .map_or_else(std::convert::identity, StoreError::from)
+                })?;
+                let Some(frame) = frame.into_option() else {
+                    return Ok(None);
+                };
+                if frame.len() > abi::MAX_FRAME {
+                    return Err(StoreError::InvalidArgument(
+                        "plugin frame exceeds limit".into(),
+                    ));
                 }
+                Ok(Some((
+                    Bytes::from_owner(frame),
+                    (ROption::RSome(stream), endpoint),
+                )))
             })
             .await
             .map_err(StoreError::other)?
@@ -183,50 +120,34 @@ impl Drop for StoreState {
         }
     }
 }
-
+impl StoreApi for StoreState {
+    fn request(&self, metadata: RVec<u8>, body: abi::Stream) -> RResult<Reply, RString> {
+        match catch_unwind(AssertUnwindSafe(|| {
+            let operation: Operation = decode(&metadata)?;
+            self.runtime.block_on(dispatch(self, operation, body))
+        })) {
+            Ok(result) => result.map_err(wire_error).into(),
+            Err(_) => RResult::RErr(wire_error(StoreError::other(anyhow::anyhow!(
+                "storage plugin panicked"
+            )))),
+        }
+    }
+    fn supports_compose(&self) -> bool {
+        catch_unwind(AssertUnwindSafe(|| self.store.supports_compose())).unwrap_or(false)
+    }
+    fn compose_is_native(&self) -> bool {
+        catch_unwind(AssertUnwindSafe(|| self.store.compose_is_native())).unwrap_or(false)
+    }
+}
 pub fn expose(store: DynStore, runtime: Handle, owned_runtime: Option<Runtime>) -> abi::Store {
-    abi::Store {
-        supports_compose: u8::from(store.supports_compose()),
-        compose_is_native: u8::from(store.compose_is_native()),
-        context: Box::into_raw(Box::new(StoreState {
+    abi::StoreApi_TO::from_value(
+        StoreState {
             store,
             runtime,
             owned_runtime,
-        }))
-        .cast(),
-        request: request_store,
-        release: release_store,
-    }
-}
-
-unsafe extern "C" fn request_store(context: *mut c_void, request: Request, out: *mut Reply) {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: Context is a live StoreState; its fields support concurrent use.
-        let state = unsafe { &*context.cast::<StoreState>() };
-        // SAFETY: Request metadata is borrowed for this synchronous call.
-        let bytes = unsafe { abi::read_slice(request.metadata, abi::MAX_METADATA) }
-            .map_err(StoreError::other)?;
-        let operation: Operation = serde_json::from_slice(bytes).map_err(StoreError::other)?;
-        state
-            .runtime
-            .block_on(dispatch(state, operation, request.body))
-    }));
-    let reply = match result {
-        Ok(Ok(reply)) => reply,
-        Ok(Err(error)) => error_reply(error),
-        Err(_) => error_reply(StoreError::other(anyhow::anyhow!(
-            "storage plugin panicked"
-        ))),
-    };
-    // SAFETY: V1 caller supplies an uninitialized writable Reply.
-    unsafe { out.write(reply) };
-}
-
-unsafe extern "C" fn release_store(context: *mut c_void) {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: Endpoint ownership releases this allocation exactly once.
-        drop(unsafe { Box::from_raw(context.cast::<StoreState>()) });
-    }));
+        },
+        TD_Opaque,
+    )
 }
 
 async fn dispatch(state: &StoreState, operation: Operation, body: abi::Stream) -> Result<Reply> {
@@ -313,41 +234,28 @@ async fn dispatch(state: &StoreState, operation: Operation, body: abi::Stream) -
 
 #[derive(Clone)]
 pub struct RemoteStore {
-    endpoint: Arc<Endpoint>,
+    endpoint: Arc<abi::Store>,
 }
 impl RemoteStore {
     pub fn new(store: abi::Store) -> Self {
         Self {
-            endpoint: Arc::new(Endpoint(store)),
+            endpoint: Arc::new(store),
         }
     }
-
     async fn call(&self, operation: Operation, body: Option<ByteStream>) -> Result<Reply> {
-        let metadata = serde_json::to_vec(&operation).map_err(StoreError::other)?;
-        if metadata.len() > abi::MAX_METADATA {
-            return Err(StoreError::InvalidArgument(
-                "plugin metadata exceeds limit".into(),
-            ));
-        }
+        let metadata = json(&operation)?;
         let body = body.map_or_else(abi::Stream::default, |body| {
             expose_stream(body, Handle::current())
         });
         let endpoint = self.endpoint.clone();
         tokio::task::spawn_blocking(move || {
-            let mut reply = Reply::default();
-            let request = Request {
-                metadata: metadata.as_slice().into(),
-                body,
-            };
-            // SAFETY: Endpoint lives through the call; request transfers body.
-            unsafe { (endpoint.0.request)(endpoint.0.context, request, &raw mut reply) };
-            match reply.status {
-                0 => Ok(reply),
-                -1 => Err(StoreError::from(decode::<WireError>(&reply.metadata)?)),
-                _ => Err(StoreError::other(anyhow::anyhow!(
-                    "invalid storage plugin status"
-                ))),
-            }
+            endpoint
+                .request(metadata, body)
+                .into_result()
+                .map_err(|error| {
+                    decode::<WireError>(error.as_bytes())
+                        .map_or_else(std::convert::identity, StoreError::from)
+                })
         })
         .await
         .map_err(StoreError::other)?
@@ -502,10 +410,10 @@ impl ObjectStore for RemoteStore {
             })
     }
     fn supports_compose(&self) -> bool {
-        self.endpoint.0.supports_compose == 1
+        self.endpoint.supports_compose()
     }
     fn compose_is_native(&self) -> bool {
-        self.endpoint.0.compose_is_native == 1
+        self.endpoint.compose_is_native()
     }
     async fn compose(
         &self,
@@ -529,25 +437,21 @@ impl ObjectStore for RemoteStore {
     }
 }
 
-/// Implementation behind `export_plugin!`. All panics stop at this C boundary.
-/// # Safety
-/// V1 create owns inner and must receive valid borrowed config and writable out/error.
-pub unsafe fn export<F, Fut>(
+/// The SDK factory boundary contains panics; no application future crosses FFI.
+pub fn export<F, Fut>(
     inner: abi::Store,
-    config: Slice,
-    out: *mut abi::Store,
-    error: *mut Buffer,
+    config: RVec<u8>,
     factory: F,
-) -> i32
+) -> RResult<abi::Store, RString>
 where
     F: FnOnce(DynStore, serde_json::Value) -> Fut,
     Fut: Future<Output = anyhow::Result<DynStore>>,
 {
-    let inner: DynStore = Arc::new(RemoteStore::new(inner));
     let result = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: V1 caller holds config readable until create returns.
-        let bytes = unsafe { abi::read_slice(config, abi::MAX_METADATA) }?;
-        let config = serde_json::from_slice(bytes)?;
+        let inner: DynStore = Arc::new(RemoteStore::new(inner));
+        let options = decode(&config);
+        drop(config);
+        let config = options?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -556,19 +460,7 @@ where
         Ok::<_, anyhow::Error>(expose(store, runtime.handle().clone(), Some(runtime)))
     }));
     match result {
-        Ok(Ok(store)) => {
-            // SAFETY: Success initializes caller's store output exactly once.
-            unsafe { out.write(store) };
-            0
-        }
-        error_result => {
-            let message = match error_result {
-                Ok(Err(e)) => e.to_string(),
-                _ => "storage plugin initialization panicked".into(),
-            };
-            // SAFETY: Failure initializes caller's error output exactly once.
-            unsafe { error.write(abi::own_buffer(message.into_bytes())) };
-            -1
-        }
+        Ok(result) => result.map_err(|e| RString::from(e.to_string())).into(),
+        Err(_) => RResult::RErr("storage plugin initialization panicked".into()),
     }
 }

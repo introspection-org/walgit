@@ -195,41 +195,57 @@ async fn missing_plugin_fails_closed() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn incompatible_descriptors_are_rejected_before_reading_function_pointers() {
-    let dir = tempfile::tempdir().unwrap();
-    for (version, size) in [(2, 8), (1, 8), (1, 1024)] {
-        let source = dir.path().join(format!("bad-{version}-{size}.c"));
-        let library = source.with_extension(if cfg!(target_os = "macos") {
-            "dylib"
-        } else {
-            "so"
-        });
-        std::fs::write(&source, format!(
-            "#include <stdint.h>\nstruct header {{ uint32_t version, size; }};\nstatic const struct header h = {{{version}, {size}}};\nconst struct header *walgit_store_plugin_v1(void) {{ return &h; }}\n"
-        )).unwrap();
-        let status = std::process::Command::new("cc")
-            .arg(if cfg!(target_os = "macos") {
-                "-dynamiclib"
-            } else {
-                "-shared"
-            })
-            .arg("-fPIC")
-            .arg(&source)
-            .arg("-o")
-            .arg(&library)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        assert!(
-            walgit_store_plugin::load(
-                &library,
-                serde_json::json!({}),
-                Arc::new(MemoryStore::new())
-            )
-            .await
-            .is_err()
-        );
+#[ignore = "requires a built incompatible module; run just test-plugin"]
+async fn incompatible_layout_is_rejected_before_initialization() {
+    let path = std::env::var("WALGIT_TEST_INCOMPATIBLE").unwrap();
+    let result = walgit_store_plugin::load(
+        std::path::Path::new(&path),
+        serde_json::json!({}),
+        Arc::new(MemoryStore::new()),
+    )
+    .await;
+    let error = result.err().expect("wrong module layout must be rejected");
+    assert!(
+        error.to_string().contains("checking storage plugin ABI"),
+        "{error:#}"
+    );
+}
+
+// A reproducible local overhead probe, not a timing assertion or a cloud benchmark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual measurement; set WALGIT_TEST_PLUGIN and run with --nocapture"]
+async fn passthrough_overhead() {
+    let path = std::env::var("WALGIT_TEST_PLUGIN").unwrap();
+    let raw: DynStore = Arc::new(MemoryStore::new());
+    let wrapped = walgit_store_plugin::load(
+        std::path::Path::new(&path),
+        serde_json::json!({}),
+        raw.clone(),
+    )
+    .await
+    .unwrap();
+    for size in [1024, 1024 * 1024, 8 * 1024 * 1024] {
+        raw.put(
+            "bench",
+            PutBody::Bytes(Bytes::from(vec![42; size])),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+        let count = if size == 1024 { 1000_u32 } else { 100_u32 };
+        for (label, store) in [("raw", &raw), ("plugin", &wrapped)] {
+            for _ in 0..10 {
+                std::hint::black_box(store.get_bytes("bench").await.unwrap().unwrap());
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..count {
+                std::hint::black_box(store.get_bytes("bench").await.unwrap().unwrap());
+            }
+            println!(
+                "BENCH bytes={size} path={label} iterations={count} mean_us={:.2}",
+                start.elapsed().as_secs_f64() * 1_000_000.0 / f64::from(count)
+            );
+        }
     }
 }

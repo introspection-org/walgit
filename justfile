@@ -101,11 +101,12 @@ test:
 test-plugin:
     #!/usr/bin/env bash
     set -euo pipefail
-    {{t10}} cargo build -p walgit-store-passthrough
+    {{t10}} cargo build -p walgit-store-passthrough --lib --example incompatible
     target="${CARGO_TARGET_DIR:-target}"
     case "$(uname -s)" in Darwin) extension=dylib ;; *) extension=so ;; esac
     WALGIT_TEST_PLUGIN="$(cd "$target/debug" && pwd)/libwalgit_store_passthrough.$extension" \
-      {{t10}} cargo test -p walgit-store-plugin --test plugin -- --include-ignored
+    WALGIT_TEST_INCOMPATIBLE="$(cd "$target/debug" && pwd)/examples/libincompatible.$extension" \
+      {{t10}} cargo test -p walgit-store-plugin --test plugin -- --include-ignored --skip passthrough_overhead
 
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
 e2e *ARGS:

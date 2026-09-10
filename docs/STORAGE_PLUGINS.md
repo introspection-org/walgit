@@ -19,42 +19,51 @@ exactly once. The decorator sees **logical keys before that prefix**. A plugin
 needing bucket/domain identity must receive a stable identifier explicitly. It
 must not infer tenant authority from an unverified request.
 
-## V1 boundary
+## Checked Rust boundary and rationale
 
-`walgit_store_plugin_v1` returns the version/size-checked C descriptor in
-`walgit-store-plugin/src/abi.rs`. The ABI uses `repr(C)` structures, C function
-pointers, fixed-width status fields, pointer-sized byte lengths and opaque
-contexts. Both sides must target the same architecture/OS. No Rust trait object,
-allocator ownership, future, string layout or unwind crosses the boundary. Rust
-plugins use `crate-type = ["cdylib"]`; no Rust compiler-specific `dylib` ABI is used.
+The interface uses [`abi_stable` 0.11.3](https://docs.rs/abi_stable/0.11.3/abi_stable/),
+with a `RootModule`, `StableAbi` layouts, `sabi_trait` endpoints and owned
+`RBox`/`RVec`/`RString` values. A normal Rust trait object is not a stable dynamic
+library interface. This mechanism checks module versions and layouts at load time
+and provides allocator-correct ownership/destruction across independently built
+Rust libraries. It follows [Rotel's Rust processor SDK](https://github.com/streamfold/rotel/blob/v0.2.5/rotel_rust_processor_sdk/src/lib.rs)
+and its async processor bridge. Safety and maintenance are the reasons for this
+choice, rather than an assumed performance gain. This is a Rust plugin API;
+plugins written in other languages would need a separate adapter.
 
-Request and result metadata are bounded UTF-8 JSON described by `wire.rs`; bytes
-are separate, pull-based streams with at most 1 MiB per frame. JSON owns no pack
-bytes. PUT takes an explicit logical length; bytes/file/stream inputs all become
-streams at the boundary. LIST is streamed as newline-delimited metadata records.
-Reads return the whole object's logical size even when their body is a range.
-Errors preserve not-found, precondition, not-modified and retryable outcomes.
-Backing versions remain opaque strings. MIME types are advisory hints; the SDK
-forwards the known Git/JSON/protobuf/plain/octet-stream hints and drops unknown
-hints rather than leaking per-request static strings.
+`abi.rs` still has `repr(C)`/`extern "C"` declarations underneath the checked
+interface. The SDK contains no hand-written raw-pointer dereferences, allocator
+release callbacks or manual vtables. `lib_header_from_path` plus
+`init_root_module` checks each library independently, as Rotel does; the singleton
+root-module loader would accidentally reuse the first plugin for subsequent paths.
+Both sides must target the same OS/architecture and compatible SDK/abi_stable
+versions. Incompatible layouts fail before initialization; there is no unchecked
+loading path. Implementation crates depend on abi_stable and export their async
+factory with `walgit_store_plugin::export_plugin!`.
 
-Each allocation carries its allocating module's release callback. Each stream
-has exactly one owner; release drops/cancels it without draining. Calls on
-different stores/streams may run concurrently, while one stream is polled
-serially. An endpoint outlives its calls and result streams. Create consumes the
-inner endpoint on success and failure. Every exported callback catches unwinding
-panics and reports failure. A panic-abort build can still terminate the process.
+Operation metadata is bounded UTF-8 JSON described by `wire.rs`; pack bytes are
+separate pull-based streams with at most 1 MiB per frame. PUT retains its explicit
+logical length. LIST streams newline-delimited records. Reads report the whole
+logical object size, including for ranges, and errors preserve not-found,
+precondition, not-modified and retryable outcomes. Versions stay opaque. Known
+Git/JSON/protobuf/plain/octet-stream MIME hints are forwarded; unknown advisory
+hints are omitted instead of leaking per-request static strings.
 
-Callbacks are synchronous and run on blocking executor threads. The SDK bridges
-to the module's own Tokio runtime, preserving bounded streaming and backpressure;
-it never calls block_on from an async worker. Plugins are trusted native code,
-not a sandbox. Libraries stay mapped until process exit to keep runtime/channel
-teardown safe; upgrade by rolling the process, not hot-unloading a library.
+Calls run on blocking executor threads and bridge to the module's own Tokio
+runtime; application futures stay within their module. Streams are polled
+serially, distinct calls may run concurrently, and response streams keep their
+endpoint alive. Dropping a stream cancels without draining. Returned RVec frames
+retain their owner through Bytes, avoiding an additional receiver-side copy.
+Factory/request/poll panics are converted to errors; aborting panics or panicking
+destructors can still terminate the process. Native plugins remain trusted code,
+not a sandbox. abi_stable retains mappings until process exit; upgrades roll
+processes, never hot-unload code.
 
-ABI evolution uses a new versioned symbol for incompatible layouts or semantics.
-Unknown operations fail, rather than falling back to the raw store. Test plugins
-against the pinned core revision before upgrades. Load only immutable library
-paths baked into the image or administrator-controlled read-only mounts.
+Public interface changes follow abi_stable's layout/evolution rules. The generic
+plugin preserves the existing ObjectStore trait and no-plugin CLI behavior. The
+only functional example is pass-through; its deliberately incompatible test
+module exists solely to exercise load-time rejection. No encryption or tenant
+policy is implemented here.
 
 ## Decorator obligations
 
@@ -82,3 +91,22 @@ streaming/file uploads, ranges across frames, CAS races, conditional reads/delet
 listing, prefix application, interrupted uploads and stream lifetime after the
 store handle is dropped. Also run ordinary Git/maintenance tests through the
 plugin before deploying a custom adapter.
+
+### Local overhead measurement
+
+A macOS arm64, test-profile `MemoryStore` probe (three alternating runs; median
+of each run's mean full-GET latency) measured:
+
+| Object bytes | Manual ABI prototype | abi_stable implementation |
+|---|---:|---:|
+| 1 KiB | 66.12 µs | 66.92 µs |
+| 1 MiB | 127.93 µs | 97.84 µs |
+| 8 MiB | 840.27 µs | 602.14 µs |
+
+Small-object overhead is comparable in this sample. The new implementation also
+avoids a receiver-side frame copy, so this does **not** isolate the cost of the
+ABI library itself. These are local in-memory timings, not a production throughput
+claim: no S3/GCS, Git, encryption or KMS is included. Safety and consistency decide
+the implementation choice; measure the real adapter's workload separately.
+The ignored `passthrough_overhead` test reproduces the current implementation's
+probe with `WALGIT_TEST_PLUGIN` set, `--ignored --nocapture --test-threads=1`.

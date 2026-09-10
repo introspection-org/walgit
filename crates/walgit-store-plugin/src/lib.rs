@@ -1,106 +1,63 @@
-//! Load a trusted storage cdylib, or export an external `ObjectStore` decorator.
-//! The ABI is C-compatible; the Rust `ObjectStore` trait stays inside each module.
-#![allow(unsafe_code)]
-
+//! Load a checked Rust storage plugin or export an external `ObjectStore` decorator.
 pub mod abi;
 mod bridge;
 mod wire;
 
-use std::path::Path;
-use std::sync::Arc;
-
+use abi_stable::library::lib_header_from_path;
 use anyhow::{Context, Result};
-use libloading::Library;
+use std::{path::Path, sync::Arc};
 use walgit_store::DynStore;
 
+pub use abi_stable;
 pub use bridge::export;
 
-/// Load a library selected by deployment configuration, never by a request.
-/// Libraries remain mapped until process exit: channels and runtime teardown may
-/// execute module code after the last request. Hot unload/reload is unsupported.
+/// Load administrator-selected native code with checked module/type layouts.
+/// Like Rotel, load each path separately; the root-module singleton convenience
+/// loader would incorrectly reuse the first module for every plugin path.
+/// `abi_stable` retains mappings until process exit. Hot unloading is unsupported.
 pub async fn load(path: &Path, config: serde_json::Value, inner: DynStore) -> Result<DynStore> {
     let path = path.to_owned();
     let runtime = tokio::runtime::Handle::current();
+    let config = serde_json::to_vec(&config)?;
+    anyhow::ensure!(
+        config.len() <= abi::MAX_METADATA,
+        "plugin options exceed limit"
+    );
     tokio::task::spawn_blocking(move || {
-        // SAFETY: The operator has selected trusted executable code for this
-        // process. Versioned entry and size are checked before creating a store.
-        let library = unsafe { Library::new(&path) }.context("loading storage plugin")?;
-        // SAFETY: V1 symbol must have the published C signature.
-        let entry = unsafe {
-            library.get::<unsafe extern "C" fn() -> *const abi::Plugin>(b"walgit_store_plugin_v1\0")
-        }
-        .context("storage plugin has no V1 entry point")?;
-        // SAFETY: Calling the documented entry point of the trusted library.
-        let descriptor = unsafe { entry() };
-        anyhow::ensure!(!descriptor.is_null(), "null storage plugin descriptor");
-        // SAFETY: Every entry must expose the fixed two-u32 header, including
-        // incompatible descriptors. Do not read the function table until checked.
-        let header = unsafe { &*descriptor.cast::<abi::PluginHeader>() };
-        anyhow::ensure!(
-            header.abi_version == abi::ABI_VERSION,
-            "unsupported storage plugin ABI"
-        );
-        anyhow::ensure!(
-            usize::try_from(header.struct_size)? == std::mem::size_of::<abi::Plugin>(),
-            "storage plugin ABI size mismatch"
-        );
-        // SAFETY: The trusted descriptor now declares the exact V1 layout.
-        let descriptor = unsafe { &*descriptor };
-        let create = descriptor.create;
-        // Only the shared code mapping is retained. Stores, streams and buffers
-        // still have explicit ownership and are destroyed normally.
-        let _mapped = Box::leak(Box::new(library));
+        let header = lib_header_from_path(&path).context("loading storage plugin")?;
+        let module: abi::PluginRef = header
+            .init_root_module()
+            .context("checking storage plugin ABI")?;
         let host = bridge::expose(inner, runtime, None);
-        let config = serde_json::to_vec(&config)?;
-        let mut out = std::mem::MaybeUninit::<abi::Store>::uninit();
-        let mut error = abi::Buffer::default();
-        // SAFETY: Inputs live through create; create consumes host even on error.
-        let status = unsafe {
-            create(
-                host,
-                config.as_slice().into(),
-                out.as_mut_ptr(),
-                &raw mut error,
-            )
-        };
-        anyhow::ensure!(
-            status == 0,
-            "storage plugin initialization failed: {}",
-            bridge::error_text(&error)
-        );
-        // SAFETY: A successful V1 create initializes out.
-        let endpoint = unsafe { out.assume_init() };
+        let endpoint = (module.create())(host, config.into())
+            .into_result()
+            .map_err(|error| anyhow::anyhow!("storage plugin initialization failed: {error}"))?;
         Ok::<DynStore, anyhow::Error>(Arc::new(bridge::RemoteStore::new(endpoint)))
     })
     .await
     .context("storage plugin loader task failed")?
 }
 
-/// Export a factory async function `(DynStore, serde_json::Value) -> Result<DynStore>`.
-/// The factory receives the configured backend with its global prefix already
-/// applied. Keys visible to the decorator are logical, unprefixed object keys.
+/// Export an async factory `(DynStore, serde_json::Value) -> Result<DynStore>`.
+/// Decorators see logical object keys, with the global prefix applied underneath.
+/// The implementation crate must depend on `abi_stable` 0.11, like this SDK.
 #[macro_export]
 macro_rules! export_plugin {
     ($factory:path) => {
         #[allow(unsafe_code)]
-        unsafe extern "C" fn walgit_plugin_create(
-            inner: $crate::abi::Store,
-            config: $crate::abi::Slice,
-            out: *mut $crate::abi::Store,
-            error: *mut $crate::abi::Buffer,
-        ) -> i32 {
-            // SAFETY: Forward the V1 loader's documented ownership contract.
-            unsafe { $crate::export(inner, config, out, error, $factory) }
-        }
-        #[allow(unsafe_code)]
-        #[unsafe(no_mangle)]
-        pub extern "C" fn walgit_store_plugin_v1() -> *const $crate::abi::Plugin {
-            static PLUGIN: $crate::abi::Plugin = $crate::abi::Plugin {
-                abi_version: $crate::abi::ABI_VERSION,
-                struct_size: std::mem::size_of::<$crate::abi::Plugin>() as u32,
-                create: walgit_plugin_create,
-            };
-            &PLUGIN
+        #[abi_stable::export_root_module]
+        pub fn get_library() -> $crate::abi::PluginRef {
+            use $crate::abi_stable::prefix_type::PrefixTypeTrait;
+            extern "C" fn create(
+                inner: $crate::abi::Store,
+                config: $crate::abi_stable::std_types::RVec<u8>,
+            ) -> $crate::abi_stable::std_types::RResult<
+                $crate::abi::Store,
+                $crate::abi_stable::std_types::RString,
+            > {
+                $crate::export(inner, config, $factory)
+            }
+            $crate::abi::Plugin { create }.leak_into_prefix()
         }
     };
 }

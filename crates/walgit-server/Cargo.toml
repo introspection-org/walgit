@@ -76,3 +76,8 @@ rcgen = { workspace = true, features = ["x509-parser"] }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "lfs_xet"
+harness = false
+required-features = ["lfs-xet"]

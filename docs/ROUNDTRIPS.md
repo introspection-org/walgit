@@ -46,6 +46,7 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Checkpoint | 1 cond GET (freshness) → refs PUT ∥ checkpoint PUT → manifest CAS | 3 rounds, 4 requests (was 6/6 until 2026-08-22: a bundle-list GET before the checkpoint PUT and a log GET for provenance times sat in the chain; times now come from the writer's own applied state, `bundle_key` is no longer looked up) | `checkpoint.rs` |
 | Settings publish (D24) | refs sync (conditional GET) → log slot PUT → manifest CAS; readers pay nothing extra (settings ride inline on the manifest) | 3 rounds; read: 0 | `publish.rs::publish_settings_impl` |
 | Lease acquire | 1 GET → 1 CAS put (or 1 Create when absent) | 2 | `coord.rs::try_acquire` |
+| Store plugin decorator (`[store.plugin]`) | none: the decorator is in-process, so every budget above is unchanged | +0 | `walgit-store-plugin/src/bridge.rs` |
 | Publish, local commit (2026-08-23) | unchanged in round trips: after the manifest CAS the ref txns are applied to the local copy **before** the new manifest version is advertised, both under `sync_mutex` (the refs phase of every sync); the reverse order let a reader cache the old refs under the new version, and without the lock a concurrent sync replayed the same entry (two `update-ref`, a lock collision). A landed CAS is answered `ok` whatever the local apply does — the next sync replays (one conditional GET that then returns 200, no extra write). | 0 extra | `publish.rs::process_batch` |
 | Weekly compose: refs at the base's seq (`refs_at_seq`, 2026-08-23) | checkpoint `refs.pb` at that seq: 1 GET; else newest checkpoint ≤ seq (2 GETs) + the log entries through the seq (already cached by the refs sync in practice) — replayed in memory, never a local write | 1, or 2 + tail | `log_reader.rs::refs_at_seq`, `bundles.rs::compose_full_from_base` |
 | Maintainer bundle pass, refs level (retention + settle closed slots) | 1 list GET → at most 1 CAS (retention) → at most **1 CAS for every verdict of the pass** (`record_skipped_many`; was one CAS per settled slot until 2026-08-22: a rig repo with 9,654 closed slots paid 9,654 CAS per pass and, past the 4,096-verdict cap, forever) | ≤ 3 | `walgit-bundle/src/lib.rs::settle_closed_slots`, `ops.rs::record_skipped_many` |
@@ -61,6 +62,15 @@ only after Create/CAS failure, so the measured happy-path counts remain unchange
 Keep this table current; when you change a protocol, update the row and put the before/after depth in the
 commit message. The sim harness can enforce it: `FaultStore::stats().ops` counts exact store requests per
 link, so a scenario can assert "a push on a healthy link is ≤ N requests" as a regression test.
+
+A plugin adds no object-store round trips, but it is not free and its cost does not
+appear in this table. Each operation crosses the library boundary as one metadata frame
+plus one frame per `MAX_FRAME` of body, and each frame is a `spawn_blocking` hop — on the
+same pool the control plane uses, so a large clone and a `head` contend (see §4). A
+decorator that talks to anything itself (a KMS, a sealing service) adds round trips this
+table cannot predict: that budget belongs to the plugin and its author must count it the
+same way. Measure a decorator against `just test-plugin` and the `passthrough_overhead`
+probe before deploying it.
 
 ## 3. Rules of thumb
 - **Depth before count.** Two PUTs in parallel cost one round trip; the same two in sequence cost two.

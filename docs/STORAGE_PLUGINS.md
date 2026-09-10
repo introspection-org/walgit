@@ -3,7 +3,24 @@
 An optional, operator-installed `cdylib` decorates the configured S3, GCS or memory
 store. The stock build contains no encryption or application identity policy.
 `examples/store-passthrough` is the complete no-op example. A downstream crate can
-return any `ObjectStore` using `walgit_store_plugin::export_plugin!(factory)`.
+return any `ObjectStore` using `walgit_store_plugin::export_plugin!(factory)`. It must
+also declare `crate-type = ["cdylib"]` and depend on `abi_stable` itself, matching the
+version this crate pins.
+
+That dependency is a wart rather than a requirement of the design. The macro expands
+`#[abi_stable::export_root_module]` through a bare path, and an attribute macro resolves
+against the plugin crate's own root and extern prelude — not through this crate's
+`pub use abi_stable` re-export, which every other path in the expansion does use
+(`$crate::abi_stable::…`). Omitting it fails with `cannot find abi_stable in the crate
+root`, which points at the `export_plugin!` call site rather than at the missing
+manifest entry, so it costs a plugin author a confusing few minutes.
+
+Two fixes were tried and neither works: `#[$crate::abi_stable::export_root_module]`
+fails because `$crate` is not resolved in attribute position, and emitting
+`use $crate::abi_stable;` ahead of the attribute fails because attribute paths do not
+consult local `use` items. Removing the wart therefore means not applying
+`export_root_module` inside the macro at all — a larger change than it appears — so it
+is documented here instead.
 
 Configure `[store.plugin]` with an absolute `library` path and an `options` table.
 Every CLI storage operation uses the same constructor: HTTP serving, maintenance,
@@ -110,3 +127,24 @@ claim: no S3/GCS, Git, encryption or KMS is included. Safety and consistency dec
 the implementation choice; measure the real adapter's workload separately.
 The ignored `passthrough_overhead` test reproduces the current implementation's
 probe with `WALGIT_TEST_PLUGIN` set, `--ignored --nocapture --test-threads=1`.
+
+A second probe does isolate the boundary, by running the same encrypting workload with
+the codec in-process and again behind the plugin. Linux x86-64, release profile,
+`MemoryStore`, 16 MiB objects read in 1 MiB `BLOCK_SIZE`-aligned ranges (a pack's real
+read shape), best-of-4:
+
+| configuration | manual ABI prototype | abi_stable implementation |
+|---|---:|---:|
+| pass-through plugin — does no work at all | 1.21–1.58 GB/s | 1.70–1.99 GB/s |
+| AES-256-GCM in-process, no plugin | 1.66–1.76 GB/s | 1.67–1.76 GB/s |
+| AES-256-GCM through the plugin | 0.55–0.74 GB/s | 0.72–0.80 GB/s |
+
+Two things this shows that the latency table above cannot. The boundary is not free at
+throughput: under the manual ABI a plugin doing *nothing* was slower than doing
+AES-256-GCM in-process. And the checked implementation is 25–30% **faster**, because an
+owned `RVec` lets `Bytes` adopt the plugin's allocation instead of copying out of it —
+so on this workload safety and speed agree rather than trading off. The cost is per byte
+rather than per request: a whole-object read matches sixteen separate 1 MiB reads, and
+raising `MAX_FRAME` from 1 MiB to 8 MiB measured *worse*, so it is not tunable by framing.
+Still `MemoryStore` and no KMS: a decorator that calls out to a key service pays round
+trips this does not measure.

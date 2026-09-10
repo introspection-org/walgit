@@ -44,7 +44,7 @@ mod serve;
 mod wal_cmd;
 
 /// The single store construction path for commands and their background roles.
-/// Decorators see logical keys; open_store applies the global prefix underneath.
+/// Decorators see logical keys; `open_store` applies the global prefix underneath.
 async fn open_store(cfg: &walgit_config::Config) -> Result<walgit_store::DynStore> {
     if let Some(plugin) = &cfg.store.plugin {
         anyhow::ensure!(

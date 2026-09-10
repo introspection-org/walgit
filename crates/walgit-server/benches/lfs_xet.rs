@@ -129,7 +129,7 @@ fn peak_rss_mib() -> f64 {
     vm_hwm_mib("/proc/self/status")
 }
 
-/// VmHWM is a process-lifetime high-water mark; writing 5 to clear_refs resets
+/// `VmHWM` is a process-lifetime high-water mark; writing 5 to `clear_refs` resets
 /// it so each run reports its own peak rather than the largest so far.
 fn reset_peak_rss() {
     let _ = std::fs::write("/proc/self/clear_refs", "5");

@@ -79,7 +79,7 @@ server entirely (**bundle-uri**: fresh clones and catch-ups are static files the
 | **events** | A small bridge tails the WAL and POSTs ref events to a webhook, exactly-once per (repo, seq, ref) with a durable cursor. `docs/EVENTS.md`. |
 | **maintenance** | Checkpoints, bundle builds, geometric compaction, base rebuilds, connectivity audits and repairs — one loop that computes the desired state from (config, WAL) every pass and does one bounded unit of the most important missing work. Self-healing by construction: an outage leaves no holes; a deleted artefact is "missing" and rebuilt identically. |
 | **auth** | `none` (loopback), `token` (static tokens), `oidc` (any OpenID Connect issuer: browser sign-in, ID tokens, and walgit-issued access tokens for git). `/services/public/install.sh` sets a developer's machine up in one idempotent command. |
-| **stores** | S3 and S3-compatible (AWS, MinIO, rustfs, R2, Ceph, …) and GCS, first class; an in-memory store for tests. |
+| **stores** | S3 and S3-compatible (AWS, MinIO, rustfs, R2, Ceph, …) and GCS, first class; Azure Blob Storage with the opt-in `walgit-store/azure` build feature; an in-memory store for tests. |
 
 ## How it works, briefly
 
@@ -159,6 +159,7 @@ just clippy        # the [workspace.lints] set across all targets, warnings are 
 just ci            # warnings, clippy, test, e2e: everything that must be green before a merge
 cargo test -p walgit-server --test sim     # fault-injection simulation (crashes, partitions, stale reads)
 just test-s3       # store contract against local rustfs
+just test-azure    # isolated Azurite contract + Git push/clone/pull/cold restart (Docker + Python Azure SDK)
 ```
 
 Code map:
@@ -166,7 +167,7 @@ Code map:
 ```
 crates/
   walgit-proto    protobuf schema (wal.proto), log framing, store keys
-  walgit-store    ObjectStore trait (CAS versions, conditional GET, range, compose); backends s3, gcs, memory; leases
+  walgit-store    ObjectStore trait (CAS versions, conditional GET, range, compose); backends s3, gcs, azure (opt-in), memory; leases
   walgit-git      bare repos on disk, receive-pack, pack ingest, refs ↔ packed-refs, advertisements, upload-pack drivers
   walgit-wal      RepoHandle: sync levels, publish (group commit + CAS), checkpoints, log reader, remote reader, tasks
   walgit-bundle   bundle-uri: slots and chains, building, header ∘ pack composition, lists, retention

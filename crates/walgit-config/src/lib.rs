@@ -293,10 +293,25 @@ pub struct AzureConfig {
     /// Overrides the derived `https://{account}.blob.core.windows.net`.
     pub endpoint: String,
     /// Env var holding a SAS token, for emulators and environments without
-    /// Entra ID. Empty selects the workload/managed identity chain.
+    /// Entra ID. Leave the variable unset to use the selected identity credential.
     pub sas_token_env: String,
+    pub credential: AzureCredential,
     /// Blocks staged in parallel for one multipart upload.
     pub max_concurrent_blocks: usize,
+}
+
+/// Explicit identity selection avoids falling through to a different principal
+/// when a configured workload identity cannot authenticate.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AzureCredential {
+    /// Workload identity when `AZURE_FEDERATED_TOKEN_FILE` is set, managed identity otherwise.
+    #[default]
+    Auto,
+    WorkloadIdentity,
+    ManagedIdentity,
+    /// Opt-in local development using `az login`.
+    AzureCli,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1115,6 +1130,7 @@ impl Default for AzureConfig {
             account: String::new(),
             endpoint: String::new(),
             sas_token_env: "AZURE_STORAGE_SAS_TOKEN".into(),
+            credential: AzureCredential::default(),
             max_concurrent_blocks: 8,
         }
     }

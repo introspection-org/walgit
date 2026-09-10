@@ -111,6 +111,13 @@ plugin before deploying a custom adapter.
 
 ### Local overhead measurement
 
+Every figure in this section is the cost of a **loaded** plugin. With `[store.plugin]`
+unset, `open_store` returns the backend store itself: no decorator is constructed and
+none of this code sits on the request path, so the per-operation cost is zero rather
+than small. `DynStore` is `Arc<dyn ObjectStore>` either way, so the plugin seam adds no
+indirection to an undecorated store. What a plugin-free build still pays is compile
+time and binary size for `abi_stable`, never per-request latency.
+
 A macOS arm64, test-profile `MemoryStore` probe (three alternating runs; median
 of each run's mean full-GET latency) measured:
 

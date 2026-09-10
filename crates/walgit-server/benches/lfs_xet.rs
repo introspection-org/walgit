@@ -1,7 +1,7 @@
 //! End-to-end comparison of the two LFS storage paths over one `ObjectStore`.
 //!
 //! Whole-object is what `lfs.rs` does today: one sha256-addressed object per
-//! version. Xet is `lfs_xet::store_object`. Both run against the same in-memory
+//! version. Xet is `lfs_xet::Xet::store_object`. Both run against the same in-memory
 //! store over the same JSONL trajectory revisions, so the difference is the
 //! storage path alone, not the backend.
 //!
@@ -21,7 +21,6 @@ use walgit_proto::keys;
 use walgit_server::lfs_xet;
 use walgit_store::memory::MemoryStore;
 use walgit_store::{DynStore, ObjectStoreExt, PutBody, PutMode};
-use xet_core_structures::merklehash::compute_data_hash;
 
 struct Xorshift(u64);
 impl Xorshift {
@@ -139,6 +138,7 @@ async fn run_whole(series: &[Bytes]) -> Run {
 
 async fn run_xet(series: &[Bytes]) -> Run {
     let store: DynStore = Arc::new(MemoryStore::new());
+    let xet = lfs_xet::Xet::new(Arc::clone(&store));
     let mut run = Run::default();
     let mut hashes = Vec::with_capacity(series.len());
 
@@ -148,15 +148,14 @@ async fn run_xet(series: &[Bytes]) -> Run {
         run.logical += b.len() as u64;
         // The LFS oid is sha256 by protocol, so this path pays it too.
         std::hint::black_box(Sha256::digest(b));
-        let h = compute_data_hash(b);
-        lfs_xet::store_object(&store, h, b.clone()).await.expect("store");
-        hashes.push(h);
+        let stats = xet.store_object(b.clone()).await.expect("store");
+        hashes.push(stats.file_hash);
     }
     run.write_secs = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
     for (b, h) in series.iter().zip(&hashes) {
-        let got = lfs_xet::load_object(&store, h).await.expect("load").expect("present");
+        let got = xet.load_object(h).await.expect("load").expect("present");
         assert_eq!(got, *b);
     }
     run.read_secs = t.elapsed().as_secs_f64();

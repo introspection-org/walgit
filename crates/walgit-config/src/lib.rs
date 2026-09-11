@@ -257,14 +257,14 @@ fn empty_plugin_options() -> serde_json::Value {
     serde_json::json!({})
 }
 
-/// Selects one of the built-in notification transports by name (`redis`).
-/// Shaped like [`StorePluginConfig`] deliberately: walgit transports the
-/// options and never interprets them.
+/// Shaped like [`StorePluginConfig`] deliberately, and loaded the same way:
+/// walgit transports the options and never interprets them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreNotifyConfig {
-    pub transport: String,
-    /// Transport-owned configuration.
+    /// Absolute path to an operator-installed cdylib. Never supplied by a client.
+    pub library: PathBuf,
+    /// Transport-owned configuration; walgit only transports this JSON value.
     #[serde(default = "empty_plugin_options")]
     pub options: serde_json::Value,
 }

@@ -15,6 +15,10 @@
 //! Notifications are latency, never correctness. Publishing is best-effort and
 //! off the caller's path, a dropped message costs one sweep interval, and
 //! `events_bridge_sweep_found_total` is what says they stopped flowing.
+//!
+//! walgit ships no transport. Which broker, how it authenticates and how it
+//! routes are deployment policy, so they live in an operator-installed plugin
+//! (`docs/NOTIFY_PLUGINS.md`) exactly as a storage capability does.
 
 use std::sync::Arc;
 
@@ -22,9 +26,6 @@ use walgit_store::{
     AccelTarget, BoxStream, DynStore, GetOptions, GetResult, ObjectMeta, ObjectStore, PutBody,
     PutOptions, Result, Version,
 };
-
-#[cfg(feature = "notify-redis")]
-mod redis;
 
 /// A transport with two ends, because one process is rarely both: `serve` and
 /// `maintain` [`publish`](Notify::publish) once an object is durable, and the
@@ -82,19 +83,59 @@ impl Wake for Arc<crate::bridge::Bridge> {
     }
 }
 
-/// The built-in transport for `[store.notify]`, or `None` when unconfigured.
-pub fn open(cfg: &walgit_config::Config) -> anyhow::Result<Option<Arc<dyn Notify>>> {
+/// The configured transport, or `None` when unconfigured. Cached: `open_store`
+/// and the subscriber both ask, and one process runs one transport — a second
+/// load would publish into a connection nothing is reading.
+pub async fn open(cfg: &walgit_config::Config) -> anyhow::Result<Option<Arc<dyn Notify>>> {
+    static LOADED: tokio::sync::OnceCell<Option<Arc<dyn Notify>>> =
+        tokio::sync::OnceCell::const_new();
     let Some(notify) = &cfg.store.notify else {
         return Ok(None);
     };
-    match notify.transport.as_str() {
-        #[cfg(feature = "notify-redis")]
-        "redis" => Ok(Some(Arc::new(redis::RedisNotify::new(
-            notify.options.clone(),
-        )?))),
-        #[cfg(not(feature = "notify-redis"))]
-        "redis" => anyhow::bail!("store.notify transport \"redis\" needs the notify-redis feature"),
-        other => anyhow::bail!("unknown store.notify transport {other:?}"),
+    anyhow::ensure!(
+        notify.library.is_absolute(),
+        "store.notify.library must be absolute"
+    );
+    let loaded = LOADED
+        .get_or_try_init(|| async {
+            let remote =
+                walgit_notify_plugin::load(&notify.library, notify.options.clone()).await?;
+            Ok::<_, anyhow::Error>(Some(Arc::new(remote) as Arc<dyn Notify>))
+        })
+        .await?;
+    Ok(loaded.clone())
+}
+
+#[async_trait::async_trait]
+impl Notify for walgit_notify_plugin::RemoteNotify {
+    fn name(&self) -> &'static str {
+        "plugin"
+    }
+
+    async fn publish(&self, key: &str) -> anyhow::Result<()> {
+        walgit_notify_plugin::RemoteNotify::publish(self, key).await
+    }
+
+    async fn subscribe(&self, on: Arc<dyn Wake>) -> anyhow::Result<()> {
+        loop {
+            match walgit_notify_plugin::RemoteNotify::next(self).await {
+                Ok(Some(key)) => {
+                    metrics::counter!("store_notify_received_total", "transport" => "plugin")
+                        .increment(1);
+                    on.finalized(&key).await;
+                }
+                Ok(None) => return Ok(()),
+                // The transport lost messages and has recovered; the keys it
+                // dropped are gone, so the sweep is what turns that gap back
+                // into delivered events.
+                Err(e) => {
+                    metrics::counter!("store_notify_gap_total", "transport" => "plugin")
+                        .increment(1);
+                    tracing::warn!(error = %e, "notify: transport gap, reconciling");
+                    on.reconcile().await;
+                }
+            }
+        }
     }
 }
 
@@ -205,17 +246,18 @@ pub fn spawn_subscriber(state: Arc<crate::AppState>) {
     let Some(bridge) = state.bridge.clone() else {
         return;
     };
-    let transport = match open(&state.cfg) {
-        Ok(Some(t)) => t,
-        Ok(None) => return,
-        // Startup already resolved this transport once to decorate the store,
-        // so reaching here means the config changed underneath us.
-        Err(e) => {
-            tracing::error!(error = %e, "notify: subscriber not started");
-            return;
+    if state.cfg.store.notify.is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        match open(&state.cfg).await {
+            Ok(Some(transport)) => spawn_subscriber_with(bridge, transport),
+            Ok(None) => {}
+            // `open_store` already resolved this at startup, so reaching here
+            // means the library went away underneath us.
+            Err(e) => tracing::error!(error = %e, "notify: subscriber not started"),
         }
-    };
-    spawn_subscriber_with(bridge, transport);
+    });
 }
 
 /// The spawn itself, for an embedder (or a test) holding its own transport.
@@ -283,14 +325,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unknown_transport_is_refused_at_startup() {
+    /// A relative path would resolve against whatever directory the process
+    /// happens to be in, which is not a thing an operator can reason about.
+    #[tokio::test]
+    async fn a_relative_library_is_refused_at_startup() {
         let mut cfg = walgit_config::Config::default();
         cfg.store.notify = Some(walgit_config::StoreNotifyConfig {
-            transport: "kafka".into(),
+            library: "libwalgit_notify_memory.so".into(),
             options: serde_json::json!({}),
         });
-        assert!(open(&cfg).is_err());
-        assert!(open(&walgit_config::Config::default()).unwrap().is_none());
+        assert!(open(&cfg).await.is_err());
+        assert!(
+            open(&walgit_config::Config::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -4,14 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[features]
-# Off by default: a stock build pulls no Redis client.
-notify-redis = ["dep:redis"]
-
 [dependencies]
 humantime.workspace = true
 walgit-proto.workspace = true
 walgit-store.workspace = true
+walgit-notify-plugin.workspace = true
 walgit-config.workspace = true
 walgit-git.workspace = true
 walgit-wal.workspace = true
@@ -61,7 +58,6 @@ parking_lot.workspace = true
 moka.workspace = true
 jsonwebtoken.workspace = true
 reqwest.workspace = true
-redis = { workspace = true, optional = true }
 base64.workspace = true
 
 bytesize.workspace = true

@@ -227,6 +227,10 @@ pub struct StaticToken {
 pub struct StoreConfig {
     /// Optional trusted shared-library decorator, applied to every CLI store.
     pub plugin: Option<StorePluginConfig>,
+    /// How this store announces a finalized commit point to the events bridge,
+    /// for buckets that cannot notify it themselves. Unset = the cloud's own
+    /// notifications (GCS Pub/Sub, S3 events) over `POST /_events/notify`.
+    pub notify: Option<StoreNotifyConfig>,
     pub backend: StoreBackend,
     pub bucket: String,
     /// Global key prefix inside the bucket (no leading slash; trailing slash added).
@@ -251,6 +255,18 @@ pub struct StorePluginConfig {
 
 fn empty_plugin_options() -> serde_json::Value {
     serde_json::json!({})
+}
+
+/// Shaped like [`StorePluginConfig`] deliberately, and loaded the same way:
+/// walgit transports the options and never interprets them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreNotifyConfig {
+    /// Absolute path to an operator-installed cdylib. Never supplied by a client.
+    pub library: PathBuf,
+    /// Transport-owned configuration; walgit only transports this JSON value.
+    #[serde(default = "empty_plugin_options")]
+    pub options: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1087,6 +1103,7 @@ impl Default for StoreConfig {
     fn default() -> Self {
         StoreConfig {
             plugin: None,
+            notify: None,
             backend: StoreBackend::Gcs,
             bucket: "walgit".into(),
             prefix: String::new(),

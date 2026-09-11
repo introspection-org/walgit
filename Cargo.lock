@@ -6217,6 +6217,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "walgit-notify-memory"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tokio",
+ "walgit-notify-plugin",
+]
+
+[[package]]
+name = "walgit-notify-plugin"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "walgit-proto"
 version = "0.1.0"
 dependencies = [
@@ -6286,6 +6309,7 @@ dependencies = [
  "walgit-bundle",
  "walgit-config",
  "walgit-git",
+ "walgit-notify-plugin",
  "walgit-proto",
  "walgit-store",
  "walgit-wal",

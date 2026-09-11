@@ -44,12 +44,12 @@ impl Server {
     }
 
     async fn start_with(store: Arc<MemoryStore>, cache: tempfile::TempDir) -> Result<Self> {
-        Self::start_with_cfg(store, cache, |_| {}).await
+        Self::start_with_cfg(store, cache, |_| {}, None).await
     }
 
     /// Fresh store + tweaked config.
     pub async fn start_with_tweak(tweak: impl FnOnce(&mut Config)) -> Result<Self> {
-        Self::start_with_cfg(MemoryStore::shared(), tempfile::tempdir()?, tweak).await
+        Self::start_with_cfg(MemoryStore::shared(), tempfile::tempdir()?, tweak, None).await
     }
 
     /// A given memory store (e.g. with `signing_fails`) + tweaked config.
@@ -57,19 +57,36 @@ impl Server {
         store: Arc<MemoryStore>,
         tweak: impl FnOnce(&mut Config),
     ) -> Result<Self> {
-        Self::start_with_cfg(store, tempfile::tempdir()?, tweak).await
+        Self::start_with_cfg(store, tempfile::tempdir()?, tweak, None).await
     }
 
     /// Second instance on the same store with a tweaked config (e.g. a tiny
     /// `cache.max_bytes` to simulate a front that cannot hold a repo's packs).
     pub async fn start_sibling_with(&self, tweak: impl FnOnce(&mut Config)) -> Result<Self> {
-        Self::start_with_cfg(self.store.clone(), tempfile::tempdir()?, tweak).await
+        Self::start_with_cfg(self.store.clone(), tempfile::tempdir()?, tweak, None).await
+    }
+
+    /// A server whose store announces finalized objects on `notify`, and whose
+    /// bridge subscribes to it — what `walgit-cli`'s `open_store` and
+    /// `walgit_server::serve` wire together in production.
+    pub async fn start_with_notify(
+        notify: Arc<dyn walgit_server::notify::Notify>,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Result<Self> {
+        Self::start_with_cfg(
+            MemoryStore::shared(),
+            tempfile::tempdir()?,
+            tweak,
+            Some(notify),
+        )
+        .await
     }
 
     async fn start_with_cfg(
         mut store: Arc<MemoryStore>,
         cache: tempfile::TempDir,
         tweak: impl FnOnce(&mut Config),
+        notify: Option<Arc<dyn walgit_server::notify::Notify>>,
     ) -> Result<Self> {
         let mut cfg = Config::default();
         cfg.store.backend = StoreBackend::Memory;
@@ -112,8 +129,19 @@ impl Server {
         cfg.server.public_url = Some(base_url.clone());
         cfg.validate().context("config validate")?;
 
-        let dyn_store: DynStore = store.clone();
+        let mut dyn_store: DynStore = store.clone();
+        let prefix = cfg.store_prefix();
+        if let Some(notify) = notify.clone() {
+            dyn_store = Arc::new(walgit_server::notify::NotifyingStore::new(
+                dyn_store, notify, prefix,
+            ));
+        }
         let state = AppState::new(Arc::new(cfg), dyn_store).await?;
+        if let Some(notify) = notify
+            && let Some(bridge) = state.bridge.clone()
+        {
+            walgit_server::notify::spawn_subscriber_with(bridge, notify);
+        }
 
         let registry = state.registry.clone();
         let bundles = state.bundles.clone();

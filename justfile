@@ -96,6 +96,17 @@ test:
     {{t10}} cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
     {{t10}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test follow --test policy
     just test-plugin
+    just test-notify-plugin
+
+# Exercise the notify boundary: publish in, subscription out, across the ABI.
+test-notify-plugin:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{t10}} cargo build -p walgit-notify-memory --lib
+    target="${CARGO_TARGET_DIR:-target}"
+    case "$(uname -s)" in Darwin) extension=dylib ;; *) extension=so ;; esac
+    WALGIT_TEST_NOTIFY_PLUGIN="$(cd "$target/debug" && pwd)/libwalgit_notify_memory.$extension" \
+        {{t10}} cargo test -p walgit-notify-plugin --test plugin -- --ignored --nocapture
 
 # Exercise the actual native boundary, including stream and store destruction.
 test-plugin:

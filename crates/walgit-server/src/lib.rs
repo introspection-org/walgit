@@ -46,6 +46,7 @@ pub mod lfs_upstream;
 pub mod maintain;
 pub mod metrics;
 pub mod middleware;
+pub mod notify;
 pub mod ops;
 pub mod pktline;
 pub mod policy;
@@ -559,6 +560,7 @@ pub async fn serve(
     let state_for_shutdown = state.clone();
     prewarm::spawn(state.clone());
     bridge::spawn_sweeper(state.clone());
+    notify::spawn_subscriber(state.clone());
     spawn_runtime_watchdog(state.registry.tasks().clone(), state.inflight.clone());
     let app = router(state);
     let listener = TcpAccept::bind(addr).await?;

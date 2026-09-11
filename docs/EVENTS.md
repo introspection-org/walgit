@@ -99,10 +99,39 @@ Wake-ups (both idempotent; they only ever call `catch_up`):
   `s3.object.key`; MinIO, rustfs and Ceph emit the same shape), or your own glue's `{"key": "repos/o/r/manifest.pb"}`
   / `{"repo": "o/r"}`. Everything else is acked and ignored; a webhook failure answers 503 so the notifier
   redelivers. Authenticated like every route (`require_read`): give the notifier a token.
+- A **`[store.notify]` transport** (below), for a bucket that cannot notify anything itself.
 - The sweep (`events.sweep_interval`, default 5 min): `list` + one conditional manifest GET per repo. Not needed
   for correctness; it is the backstop *and the health check* — a sweep that publishes anything means
   notifications are not flowing (`events_bridge_sweep_found_total`, warn). With no notifier at all, set the
   sweep to the latency you can live with.
+
+### When the bucket cannot notify
+
+GCS and S3 announce a finalized object for you. An in-cluster bucket usually does not, which leaves the sweep as
+the only wake-up: correct, but minutes late. `[store.notify]` supplies the missing half over a broker you already
+run.
+
+It is wired as an **`ObjectStore` decorator**, not as a hook on the WAL's five manifest writes, so the invariant
+above is untouched: the push path calls `put`, and the *store* announces the object it just made durable —
+structurally the same event a bucket notification is, carrying the same full object name. Publishing is spawned
+and best-effort: a broker outage cannot slow or fail a push, and costs one sweep interval of latency.
+
+```toml
+[store.notify]
+transport = "redis"
+options = { url = "redis://valkey:6379", channel = "walgit:object-finalized" }
+```
+
+`serve` and `maintain` publish; the `events` role subscribes. Classic `PUBLISH`/`SUBSCRIBE` is deliberate — in
+Redis Cluster it crosses the cluster bus to every node, so publisher and subscriber need not share one; sharded
+pub/sub does not, and a cluster client exposes neither call. There is no replay, so a reconnecting subscriber
+sweeps once it is listening again rather than silently absorbing the gap. Metrics:
+`store_notify_published_total{transport}`, `store_notify_failed_total{transport}`,
+`store_notify_received_total{transport}`.
+
+Redis lives behind the `notify-redis` feature — on in the shipped `walgit` binary, off in the `walgit-server`
+library, so nothing pulls a Redis client by accident. Another transport is a `walgit_server::notify::Notify`
+impl (`publish`, `subscribe`, either one a provided no-op) plus an arm in `notify::open`.
 
 ```toml
 [server]

@@ -261,3 +261,52 @@ async fn bridge_sink_failure_keeps_the_cursor() -> TestResult {
     assert_eq!(resp.status(), 503, "non-2xx so Pub/Sub redelivers");
     Ok(())
 }
+
+/// A transport whose two halves are the same process: what the store
+/// publishes, the bridge receives. No broker, but every seam in between is
+/// the production one.
+struct Loopback(tokio::sync::broadcast::Sender<String>);
+
+#[async_trait::async_trait]
+impl walgit_server::notify::Notify for Loopback {
+    fn name(&self) -> &'static str {
+        "loopback"
+    }
+    async fn publish(&self, key: &str) -> anyhow::Result<()> {
+        self.0.send(key.to_string()).ok();
+        Ok(())
+    }
+    async fn subscribe(&self, on: Arc<dyn walgit_server::notify::Wake>) -> anyhow::Result<()> {
+        let mut rx = self.0.subscribe();
+        while let Ok(key) = rx.recv().await {
+            on.finalized(&key).await;
+        }
+        Ok(())
+    }
+}
+
+/// A `[store.notify]` transport is a wake-up in its own right: with the sweep
+/// off and nothing posting to `/_events/notify`, the manifest CAS is the only
+/// thing that can reach the webhook.
+#[tokio::test(flavor = "multi_thread")]
+async fn store_notification_wakes_the_bridge() -> TestResult {
+    let (url, captured) = webhook().await;
+    let notify = Arc::new(Loopback(tokio::sync::broadcast::channel(64).0));
+    let server = Server::start_with_notify(notify, bridge_cfg(&url, Duration::ZERO)).await?;
+    server.put_repo("t", "r").await?;
+
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(&src, &["commit", "--allow-empty", "-m", "a"])?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    git_in(
+        &src,
+        &["remote", "add", "origin", &server.repo_url("t", "r")],
+    )?;
+    git_in(&src, &["push", "-u", "origin", "main"])?;
+
+    let events = wait_for(&captured, 1).await;
+    assert_eq!(events[0]["ref_name"], "refs/heads/main");
+    assert_eq!(events[0]["action"], "create");
+    assert_eq!(cursor_seq(&server, "t", "r").await, Some(1));
+    Ok(())
+}

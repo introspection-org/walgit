@@ -17,6 +17,12 @@ path = "src/bin/walgit.rs"
 name = "walgit-server"
 path = "src/bin/walgit-server.rs"
 
+[features]
+# On here, off in walgit-server: the shipped binary can talk to an
+# in-cluster Redis without a custom build.
+default = ["notify-redis"]
+notify-redis = ["walgit-server/notify-redis"]
+
 [dependencies]
 walgit-proto.workspace = true
 walgit-store.workspace = true

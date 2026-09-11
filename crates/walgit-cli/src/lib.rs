@@ -57,16 +57,33 @@ async fn open_store(cfg: &walgit_config::Config) -> Result<walgit_store::DynStor
             "storage plugins cannot use cache.store_mount"
         );
     }
+    // Same hazard as a plugin: a mount bypasses ObjectStore, so the commit
+    // point would never be announced and only the sweep would find it.
+    anyhow::ensure!(
+        cfg.store.notify.is_none() || cfg.cache.store_mount.is_none(),
+        "store.notify cannot use cache.store_mount"
+    );
     let store = walgit_store::open_store(cfg).await?;
-    match &cfg.store.plugin {
+    let store = match &cfg.store.plugin {
         Some(plugin) => {
-            walgit_store_plugin::load(&plugin.library, plugin.options.clone(), store).await
+            walgit_store_plugin::load(&plugin.library, plugin.options.clone(), store).await?
         }
-        None => Ok(store),
-    }
+        None => store,
+    };
+    // Outermost, so it announces what actually reached the backend — including
+    // anything a plugin rewrote on the way down.
+    Ok(match walgit_server::notify::open(cfg)? {
+        Some(notify) => Arc::new(walgit_server::notify::NotifyingStore::new(
+            store,
+            notify,
+            cfg.store_prefix(),
+        )),
+        None => store,
+    })
 }
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

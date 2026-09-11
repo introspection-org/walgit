@@ -146,6 +146,7 @@ flate2 = "1"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 pin-project-lite = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
 base64 = "0.22"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 libc = "0.2"

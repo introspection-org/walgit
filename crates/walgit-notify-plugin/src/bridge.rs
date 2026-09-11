@@ -1,5 +1,3 @@
-//! Both sides of the boundary: the host's handle on a plugin endpoint, and the
-//! plugin's adapter from ordinary async Rust onto the synchronous ABI.
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
@@ -16,10 +14,8 @@ pub trait NotifySource: Send + Sync {
     async fn next(&self) -> anyhow::Result<Option<String>>;
 }
 
-/// The host's handle. Endpoint calls block, so both run on blocking workers;
-/// `next` in particular parks there for the life of a subscription. Cloning
-/// shares one transport, which is how one deployment publishes from its store
-/// and subscribes from its bridge.
+/// Endpoint calls block, so both run on blocking workers; `next` parks there
+/// for the life of a subscription. Cloning shares one transport.
 #[derive(Clone)]
 pub struct RemoteNotify {
     endpoint: Arc<abi::Notify>,
@@ -74,8 +70,8 @@ impl Drop for NotifyState {
 }
 
 impl NotifyState {
-    /// A panic must not unwind across FFI and a shutting-down runtime must not
-    /// be used: both become an error the host logs.
+    /// A panic must not unwind across FFI, and a shutting-down runtime must
+    /// not be used.
     fn guard<T>(
         &self,
         call: impl FnOnce(&dyn NotifySource, &Handle) -> anyhow::Result<T>,
@@ -113,8 +109,7 @@ where
         let options = serde_json::from_slice(&config);
         drop(config);
         let config: serde_json::Value = options?;
-        // The transport's own runtime: a subscription outlives every call, so
-        // it cannot borrow the host's.
+        // A subscription outlives every call, so it cannot borrow the host's.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()

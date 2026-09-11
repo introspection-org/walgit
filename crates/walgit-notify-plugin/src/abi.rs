@@ -19,13 +19,11 @@ pub const MAX_METADATA: usize = 16 * 1024 * 1024;
 /// synchronous; the SDK handles blocking dispatch and panic errors.
 #[sabi_trait]
 pub trait NotifyApi: Send + Sync {
-    /// Announce a durable object, named as a bucket notification names it.
+    /// Named as a bucket notification names it: full object name, prefix included.
     fn publish(&self, key: RString) -> RResult<(), RString>;
-    /// Block for the next announcement; `RNone` ends the subscription.
-    ///
-    /// An error means messages were lost AND the transport has already
-    /// recovered. Reporting before recovering reopens the gap underneath the
-    /// host's reconciliation, which is the one ordering that matters here.
+    /// Blocks for the next announcement; `RNone` ends the subscription. An
+    /// error means messages were lost AND the transport has already recovered
+    /// — reporting first reopens the gap under the host's reconciliation.
     #[sabi(last_prefix_field)]
     fn next(&self) -> RResult<ROption<RString>, RString>;
 }
@@ -35,7 +33,6 @@ pub type Notify = NotifyApi_TO<'static, RBox<()>>;
 #[derive(StableAbi)]
 #[sabi(kind(Prefix(prefix_ref = PluginRef)))]
 pub struct Plugin {
-    /// Options are JSON, opaque to walgit.
     #[sabi(last_prefix_field)]
     pub create: extern "C" fn(RVec<u8>) -> RResult<Notify, RString>,
 }

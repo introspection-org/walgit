@@ -1,9 +1,6 @@
-//! Load a checked Rust notify transport, or export one.
-//!
-//! walgit ships no transport and depends on no client library for one. A
-//! deployment whose bucket cannot notify the events bridge installs a shared
-//! library that can — GCP Pub/Sub, Redis pub/sub, NATS, or whatever it already
-//! runs — and walgit moves object names across a checked boundary.
+//! Load a checked Rust notify transport, or export one. walgit ships none and
+//! depends on no broker client: a deployment installs a shared library that
+//! speaks GCP Pub/Sub, Redis pub/sub, NATS or whatever it already runs.
 pub mod abi;
 mod bridge;
 

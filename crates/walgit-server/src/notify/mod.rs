@@ -1,24 +1,10 @@
-//! Store notifications: how a finalized commit point reaches the events bridge
-//! (`docs/EVENTS.md`) when the bucket cannot announce it itself.
+//! Announces a finalized commit point to the events bridge where the bucket
+//! cannot (`docs/EVENTS.md`, `docs/NOTIFY_PLUGINS.md`). Decorating the store
+//! rather than hooking the WAL's five manifest writes is what keeps the
+//! invariant intact: nothing on the push path knows events exist.
 //!
-//! On GCS or S3 the *store* announces the object — a bucket notification names
-//! the finalized `…/manifest.pb` and `POST /_events/notify` receives it. An
-//! in-cluster bucket (`MinIO`, a self-hosted plane) usually has no such wiring,
-//! and the bridge falls back to the sweep: correct, but minutes late.
-//!
-//! [`NotifyingStore`] restores the missing half in the same architectural
-//! position. It decorates the store rather than hooking the five manifest
-//! writes in `walgit-wal`, so the invariant holds unchanged: nothing on the
-//! push path knows events exist. The push path calls `put`; the *store*
-//! announces the object it just made durable, exactly as a bucket does.
-//!
-//! Notifications are latency, never correctness. Publishing is best-effort and
-//! off the caller's path, a dropped message costs one sweep interval, and
-//! `events_bridge_sweep_found_total` is what says they stopped flowing.
-//!
-//! walgit ships no transport. Which broker, how it authenticates and how it
-//! routes are deployment policy, so they live in an operator-installed plugin
-//! (`docs/NOTIFY_PLUGINS.md`) exactly as a storage capability does.
+//! Notifications are latency, never correctness — the sweep is the backstop,
+//! so publishing is best-effort and off the caller's path.
 
 use std::sync::Arc;
 
@@ -27,24 +13,19 @@ use walgit_store::{
     PutOptions, Result, Version,
 };
 
-/// A transport with two ends, because one process is rarely both: `serve` and
-/// `maintain` [`publish`](Notify::publish) once an object is durable, and the
-/// `events` role [`subscribe`](Notify::subscribe)s. Either end may be the
-/// provided no-op — `publish` where the storage layer announces for us,
-/// `subscribe` where wake-ups arrive over HTTP instead.
+/// Two ends, because one process is rarely both: `serve` and `maintain`
+/// publish, the `events` role subscribes. Either may be the provided no-op.
 #[async_trait::async_trait]
 pub trait Notify: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
-    /// `key` is the full object name including the store's global prefix, so
-    /// it is byte-identical to what a bucket notification would carry.
+    /// The full object name, prefix included, as a bucket notification carries it.
     async fn publish(&self, key: &str) -> anyhow::Result<()> {
         let _ = key;
         Ok(())
     }
 
-    /// Runs until the process ends, waking `on` for every key received. An
-    /// implementation owns its own reconnection.
+    /// Runs until the process ends; the transport owns its own reconnection.
     async fn subscribe(&self, on: Arc<dyn Wake>) -> anyhow::Result<()> {
         let _ = on;
         std::future::pending::<()>().await;
@@ -52,15 +33,11 @@ pub trait Notify: Send + Sync + 'static {
     }
 }
 
-/// What a subscription does with what it receives. Implemented by the bridge;
-/// a test substitutes a recorder.
 #[async_trait::async_trait]
 pub trait Wake: Send + Sync + 'static {
     async fn finalized(&self, key: &str);
-    /// Called after a subscription gap. Pub/sub has no replay, so a transport
-    /// must not silently absorb its own reconnect: the keys published while it
-    /// was away are simply gone, and waiting for the periodic sweep to notice
-    /// is the staleness this whole module exists to remove.
+    /// A transport must not absorb its own reconnect: there is no replay, so
+    /// the keys it missed are gone until something sweeps.
     async fn reconcile(&self);
 }
 
@@ -72,8 +49,7 @@ impl Wake for Arc<crate::bridge::Bridge> {
                 tracing::debug!(repo = %report.repo, emitted = report.emitted, "notify: caught up");
             }
             Ok(None) => {}
-            // At-least-once is the sweep's job, not the transport's: retrying
-            // here would stall every later key behind one broken repo.
+            // Retrying here would stall every later key behind one broken repo.
             Err(e) => tracing::warn!(error = %e, key, "notify: catch-up failed"),
         }
     }
@@ -83,9 +59,8 @@ impl Wake for Arc<crate::bridge::Bridge> {
     }
 }
 
-/// The configured transport, or `None` when unconfigured. Cached: `open_store`
-/// and the subscriber both ask, and one process runs one transport — a second
-/// load would publish into a connection nothing is reading.
+/// Cached because `open_store` and the subscriber both ask: a second load
+/// would publish into a connection nothing is reading.
 pub async fn open(cfg: &walgit_config::Config) -> anyhow::Result<Option<Arc<dyn Notify>>> {
     static LOADED: tokio::sync::OnceCell<Option<Arc<dyn Notify>>> =
         tokio::sync::OnceCell::const_new();
@@ -125,9 +100,6 @@ impl Notify for walgit_notify_plugin::RemoteNotify {
                     on.finalized(&key).await;
                 }
                 Ok(None) => return Ok(()),
-                // The transport lost messages and has recovered; the keys it
-                // dropped are gone, so the sweep is what turns that gap back
-                // into delivered events.
                 Err(e) => {
                     metrics::counter!("store_notify_gap_total", "transport" => "plugin")
                         .increment(1);
@@ -144,9 +116,8 @@ impl Notify for walgit_notify_plugin::RemoteNotify {
 pub struct NotifyingStore {
     inner: DynStore,
     notify: Arc<dyn Notify>,
-    /// The store's global prefix, re-applied to the announced name: the
-    /// decorator sits above `Prefixed` and therefore sees logical keys, while
-    /// the bridge strips the prefix exactly as it does from a bucket's own.
+    /// Re-applied to the announced name: this sits above `Prefixed` and so
+    /// sees logical keys, but the bridge strips a prefix off what it receives.
     prefix: String,
 }
 
@@ -159,8 +130,8 @@ impl NotifyingStore {
         }
     }
 
-    /// Off the caller's path in every sense: a spawned task, so a slow broker
-    /// cannot add latency to a push, and a logged failure, so it cannot fail one.
+    /// Spawned and logged, so a slow or broken broker can neither delay a
+    /// push nor fail one.
     fn announce(&self, key: &str) {
         if !key.ends_with("/manifest.pb") {
             return;
@@ -232,16 +203,13 @@ impl ObjectStore for NotifyingStore {
         sources: &[String],
         opts: PutOptions,
     ) -> Result<ObjectMeta> {
-        // Composition writes an object like any other put; a composed manifest
-        // must announce itself too.
         let meta = self.inner.compose(dest, sources, opts).await?;
         self.announce(dest);
         Ok(meta)
     }
 }
 
-/// Spawns the subscription when this instance is the bridge and a transport is
-/// configured. Without a bridge there is nothing to wake.
+/// Without a bridge there is nothing to wake.
 pub fn spawn_subscriber(state: Arc<crate::AppState>) {
     let Some(bridge) = state.bridge.clone() else {
         return;
@@ -260,7 +228,7 @@ pub fn spawn_subscriber(state: Arc<crate::AppState>) {
     });
 }
 
-/// The spawn itself, for an embedder (or a test) holding its own transport.
+/// For an embedder or a test holding its own transport.
 pub fn spawn_subscriber_with(bridge: Arc<crate::bridge::Bridge>, transport: Arc<dyn Notify>) {
     tracing::info!(
         transport = transport.name(),
@@ -293,8 +261,7 @@ mod tests {
         }
     }
 
-    /// Only the commit point is announced, and it carries the global prefix so
-    /// the bridge strips it exactly as it does a bucket notification's.
+    /// Only the commit point is announced, carrying the prefix the bridge strips.
     #[tokio::test]
     async fn announces_prefixed_manifests_only() {
         let recorder = Arc::new(Recorder::default());
@@ -325,8 +292,7 @@ mod tests {
         );
     }
 
-    /// A relative path would resolve against whatever directory the process
-    /// happens to be in, which is not a thing an operator can reason about.
+    /// A relative path resolves against whatever directory the process is in.
     #[tokio::test]
     async fn a_relative_library_is_refused_at_startup() {
         let mut cfg = walgit_config::Config::default();

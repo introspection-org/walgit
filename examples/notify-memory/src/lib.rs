@@ -1,7 +1,5 @@
-//! Minimal external-transport example: a queue in this process, with no broker
-//! and no client library. It exists to prove the boundary round-trips, which
-//! is as far as an in-tree transport should go — a real one (GCP Pub/Sub,
-//! Redis pub/sub, NATS) carries credentials and routing walgit should not.
+//! Minimal external-transport example: a queue in this process, proving the
+//! boundary round-trips without a broker or a client library.
 use std::collections::VecDeque;
 
 use tokio::sync::{Mutex, Notify};
@@ -23,8 +21,8 @@ impl NotifySource for MemoryNotify {
 
     async fn next(&self) -> anyhow::Result<Option<String>> {
         loop {
-            // Register before re-checking: a publish landing between the check
-            // and the await would otherwise park this call until the next one.
+            // Register before re-checking, or a publish landing in between
+            // parks this call until the following one.
             let pending = self.waiting.notified();
             if let Some(key) = self.queue.lock().await.pop_front() {
                 return Ok(Some(key));

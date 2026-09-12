@@ -33,8 +33,9 @@ async fn sts(State(recorded): State<Recorded>, body: String) -> (HeaderMap, Stri
         requests.tokens.push(body);
         requests.tokens.len()
     };
-    // First identity is within the SDK's refresh window. The next is long-lived.
-    let lifetime = if sequence == 1 { 1 } else { 3600 };
+    // The startup probe takes the first identity; the second, which signs the
+    // first request, is within the SDK's refresh window. The rest are long-lived.
+    let lifetime = if sequence <= 2 { 1 } else { 3600 };
     let expires = DateTime::from(SystemTime::now() + Duration::from_secs(lifetime))
         .fmt(Format::DateTime)
         .unwrap();
@@ -135,8 +136,8 @@ async fn web_identity_is_used_and_refreshed_for_sdk_and_presigned_requests() {
     let requests = recorded.lock().unwrap();
     assert_eq!(
         requests.tokens.len(),
-        2,
-        "one initial exchange and one refresh"
+        3,
+        "the startup probe, the first request's exchange and one refresh"
     );
     assert!(
         requests
@@ -157,20 +158,20 @@ async fn web_identity_is_used_and_refreshed_for_sdk_and_presigned_requests() {
         3,
         "HEAD, GET and a cached HEAD, no extra bucket probes"
     );
-    assert!(requests.signed.first().unwrap().contains("TESTIRSAKEY1/"));
+    assert!(requests.signed.first().unwrap().contains("TESTIRSAKEY2/"));
     assert!(
         requests
             .signed
             .iter()
             .skip(1)
-            .all(|s| s.contains("TESTIRSAKEY2/"))
+            .all(|s| s.contains("TESTIRSAKEY3/"))
     );
     assert_eq!(
         requests.session_tokens,
         [
-            "synthetic-session-1",
             "synthetic-session-2",
-            "synthetic-session-2"
+            "synthetic-session-3",
+            "synthetic-session-3"
         ]
     );
 }
@@ -219,6 +220,14 @@ async fn partial_or_empty_explicit_keys_fail_without_falling_back() {
     }
 }
 
+#[tokio::test]
+async fn a_host_with_no_identity_fails_at_startup_not_on_the_first_request() {
+    let recorded = run_case("no-identity", &[]).await;
+    let requests = recorded.lock().unwrap();
+    assert!(requests.tokens.is_empty());
+    assert!(requests.signed.is_empty());
+}
+
 // Re-entered only by run_case; never changes this test runner's environment.
 #[tokio::test]
 async fn credential_child() {
@@ -236,6 +245,16 @@ async fn credential_child() {
         },
         ..Default::default()
     };
+    if case == "no-identity" {
+        // No web identity, no profile, no IMDS: the chain has nothing to offer.
+        std::fs::remove_file(std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").unwrap()).unwrap();
+        let error = S3Store::new(&cfg)
+            .await
+            .err()
+            .expect("an unresolvable chain must fail construction");
+        assert!(error.to_string().contains("resolved nothing"));
+        return;
+    }
     let result = S3Store::new(&cfg).await;
     if case == "invalid" {
         let error = result

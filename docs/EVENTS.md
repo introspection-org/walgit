@@ -104,10 +104,36 @@ Wake-ups (both idempotent; they only ever call `catch_up`):
   one: it posts a `SubscriptionValidationEvent`, which this route echoes back automatically. Authenticate the
   subscription with Microsoft Entra ID so the delivery carries a bearer token; a query-string secret will not
   satisfy `require_read`.
+- A **`[store.notify]` transport** (below), for a bucket that cannot notify anything itself.
 - The sweep (`events.sweep_interval`, default 5 min): `list` + one conditional manifest GET per repo. Not needed
   for correctness; it is the backstop *and the health check* — a sweep that publishes anything means
   notifications are not flowing (`events_bridge_sweep_found_total`, warn). With no notifier at all, set the
   sweep to the latency you can live with.
+
+### When the bucket cannot notify
+
+GCS and S3 announce a finalized object for you. An in-cluster bucket usually does not,
+which leaves the sweep as the only wake-up: correct, but minutes late. `[store.notify]`
+loads an operator-installed transport that closes the gap — GCP Pub/Sub, Redis pub/sub,
+SNS, NATS or a plain queue; walgit ships none and depends on no broker client.
+See [NOTIFY_PLUGINS.md](NOTIFY_PLUGINS.md).
+
+```toml
+[store.notify]
+library = "/usr/local/lib/walgit/libmy_notify.so"
+options = {}
+```
+
+It is wired as an **`ObjectStore` decorator**, not as a hook on the WAL's five manifest
+writes, so the invariant above is untouched: the push path calls `put`, and the *store*
+announces the object it just made durable — structurally the same event a bucket
+notification is, carrying the same full object name. Publishing is spawned and
+best-effort: a broker outage cannot slow or fail a push, and costs one sweep interval.
+`serve` and `maintain` publish, the `events` role subscribes, and a transport that loses
+messages reports a gap the bridge reconciles by sweeping. Metrics:
+`store_notify_published_total{transport}`, `store_notify_failed_total{transport}`,
+`store_notify_received_total{transport}`, `store_notify_gap_total{transport}`.
+
 
 ```toml
 [server]

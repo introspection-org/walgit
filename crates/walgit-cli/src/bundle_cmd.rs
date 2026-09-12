@@ -6,9 +6,9 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use tracing::info;
 
+use crate::open_store;
 use walgit_bundle::Bundler;
 use walgit_config::Config;
-use walgit_store::open_store;
 use walgit_wal::Registry;
 
 use crate::BundleAction;

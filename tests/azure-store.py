@@ -149,7 +149,8 @@ def main():
         address = run([runtime, "port", name, "10000/tcp"], capture=True).stdout.strip().splitlines()[0]
         endpoint = f"http://{address}/{ACCOUNT}"
         client = BlobServiceClient(endpoint, credential=KEY, retry_total=0, connection_timeout=1)
-        for _ in range(100):
+        # A cold container runtime can take well over ten seconds to start Node.
+        for _ in range(600):
             try:
                 client.create_container(CONTAINER)
                 break

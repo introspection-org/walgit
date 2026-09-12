@@ -45,7 +45,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::config::{Credentials, ProvideCredentials};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream as S3ByteStream;
 use bytes::Bytes;
@@ -96,13 +96,20 @@ impl S3Store {
                     std::env::var("AWS_SESSION_TOKEN").ok(),
                 ))
             }
-            (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => s3_config
-                .credentials_provider(
+            (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
+                let chain =
                     aws_config::default_provider::credentials::DefaultCredentialsChain::builder()
                         .region(region)
                         .build()
-                        .await,
-                ),
+                        .await;
+                // Resolve once now, so a host with no AWS identity fails at startup
+                // with the chain's own reason rather than on the first request,
+                // after the profile and IMDS lookups have timed out.
+                chain.provide_credentials().await.map_err(|e| {
+                    anyhow::anyhow!("s3: the AWS default credential chain resolved nothing: {e}")
+                })?;
+                s3_config.credentials_provider(chain)
+            }
             _ => anyhow::bail!(
                 "set both {} and {} to non-empty credentials, or leave both unset for the AWS default credential chain",
                 cfg.s3.access_key_env,

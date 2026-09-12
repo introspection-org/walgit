@@ -57,6 +57,7 @@ where
         multipart_threshold: bytesize::ByteSize::b(0),
         multipart_part_size: bytesize::ByteSize::b(4),
         azure: walgit_config::AzureConfig {
+            account: "account".into(),
             max_concurrent_blocks: 2,
             ..Default::default()
         },
@@ -487,7 +488,21 @@ async fn listing_errors_and_non_cas_conflicts_are_not_hidden() {
     );
     let error = store.list("", None).next().await.unwrap().unwrap_err();
     assert!(!error.is_precondition_failed());
+    assert!(
+        error.is_retryable(),
+        "a container mid-delete resolves on its own"
+    );
     assert!(store.list_prefixes("").await.is_err());
+    let lease = azure_core::Error::new(
+        ErrorKind::HttpResponse {
+            status: StatusCode::Conflict,
+            error_code: Some("LeaseIdMissing".into()),
+            raw_response: None,
+        },
+        "lease",
+    );
+    let mapped = map_error("key", &lease);
+    assert!(!mapped.is_retryable() && !mapped.is_precondition_failed());
     let error = azure_core::Error::with_message(ErrorKind::Io, "https://example/?sig=SECRET");
     let mapped = map_error("key", &error);
     assert!(mapped.is_retryable());
@@ -585,4 +600,206 @@ async fn conditional_delete_only_probes_absence_after_precondition_failure() {
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].method(), Method::Delete);
     assert_eq!(calls[1].method(), Method::Head);
+}
+
+#[tokio::test]
+async fn small_file_and_stream_bodies_are_one_request() {
+    let (mut store, calls) = fixture(|_| async { Ok(ok()) }, None);
+    store.multipart_threshold = 64;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), b"pack bytes").unwrap();
+    store
+        .put(
+            "packs/small",
+            PutBody::File(file.path().into()),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "leases/small",
+            PutBody::Stream {
+                len: 5,
+                stream: util::once(Bytes::from_static(b"lease")),
+            },
+            PutMode::Overwrite.into(),
+        )
+        .await
+        .unwrap();
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "one Put Blob per small body, no staging");
+        assert!(calls.iter().all(|r| query(r, "comp").is_none()));
+        assert_eq!(header(&calls[0], "if-none-match"), Some("*"));
+        assert_eq!(Bytes::from(calls[0].body()), "pack bytes");
+        assert_eq!(header(&calls[0], "content-length"), Some("10"));
+    }
+    // A declared length the stream does not deliver never reaches the service.
+    assert!(
+        store
+            .put(
+                "leases/short",
+                PutBody::Stream {
+                    len: 9,
+                    stream: util::once(Bytes::from_static(b"lease")),
+                },
+                PutMode::Overwrite.into(),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    // Above the threshold a file is still staged and committed.
+    std::fs::write(file.path(), vec![b'x'; 65]).unwrap();
+    store
+        .put(
+            "packs/large",
+            PutBody::File(file.path().into()),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        query(calls.last().unwrap(), "comp").as_deref(),
+        Some("blocklist")
+    );
+}
+
+#[derive(Debug)]
+struct FixedCredential;
+#[async_trait]
+impl TokenCredential for FixedCredential {
+    async fn get_token(
+        &self,
+        _: &[&str],
+        _: Option<TokenRequestOptions<'_>>,
+    ) -> azure_core::Result<AccessToken> {
+        Ok(AccessToken::new(
+            "synthetic-token",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        ))
+    }
+}
+
+const KEY_VALUE: &str = "c3ludGhldGljLWRlbGVnYXRpb24ta2V5"; // "synthetic-delegation-key"
+
+fn delegation_key_xml(expiry: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?><UserDelegationKey>\
+         <SignedOid>oid-1</SignedOid><SignedTid>tid-1</SignedTid>\
+         <SignedStart>2026-01-01T00:00:00Z</SignedStart><SignedExpiry>{expiry}</SignedExpiry>\
+         <SignedService>b</SignedService><SignedVersion>2025-01-05</SignedVersion>\
+         <Value>{KEY_VALUE}</Value></UserDelegationKey>"
+    )
+}
+
+#[tokio::test]
+async fn signed_urls_are_user_delegation_sas_from_one_cached_key() {
+    let key_expiry = sas_time(OffsetDateTime::now_utc() + Duration::hours(1));
+    let (store, calls) = fixture(
+        move |r| {
+            let body = delegation_key_xml(&key_expiry);
+            async move {
+                assert_eq!(r.method(), Method::Post);
+                assert_eq!(query(&r, "comp").as_deref(), Some("userdelegationkey"));
+                assert_eq!(r.url().path(), "/");
+                assert_eq!(header(&r, "authorization"), Some("Bearer synthetic-token"));
+                let key_info = String::from_utf8(Bytes::from(r.body()).to_vec()).unwrap();
+                assert!(key_info.contains("<KeyInfo><Start>") && key_info.contains("Z</Expiry>"));
+                Ok(response(StatusCode::Ok, body, &[]))
+            }
+        },
+        Some(Arc::new(FixedCredential)),
+    );
+    let ttl = std::time::Duration::from_mins(30);
+    let url = store
+        .signed_get_url("repos/o/r ?#/bundle.pack", ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    let url = Url::parse(&url).unwrap();
+    assert_eq!(url.scheme(), "https");
+    assert_eq!(
+        url.path(),
+        "/container/repos%2Fo%2Fr%20%3F%23%2Fbundle.pack"
+    );
+    let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(q["sv"], "2020-12-06");
+    assert_eq!(q["sr"], "b");
+    assert_eq!(q["sp"], "r");
+    assert_eq!(q["spr"], "https");
+    assert_eq!(q["skoid"], "oid-1");
+    assert_eq!(q["sktid"], "tid-1");
+    assert_eq!(q["skt"], "2026-01-01T00:00:00Z");
+    assert_eq!(q["sks"], "b");
+    assert_eq!(q["skv"], "2025-01-05");
+    assert!(q["st"].ends_with('Z') && q["se"].ends_with('Z') && q["st"] < q["se"]);
+    // The 2020-12-06 string-to-sign, written out line by line so the layout is
+    // pinned here rather than shared with the implementation.
+    let string_to_sign = format!(
+        "r\n{st}\n{se}\n/blob/account/container/repos/o/r ?#/bundle.pack\n\
+         oid-1\ntid-1\n2026-01-01T00:00:00Z\n{ske}\nb\n2025-01-05\n\n\n\n\nhttps\n2020-12-06\nb\n\n\n\n\n\n\n",
+        st = q["st"],
+        se = q["se"],
+        ske = q["ske"],
+    );
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"synthetic-delegation-key").unwrap();
+    mac.update(string_to_sign.as_bytes());
+    let expected = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    assert_eq!(q["sig"], expected);
+    assert!(!url.as_str().contains(KEY_VALUE));
+
+    // The key is reused while it covers the URL, and replaced once it cannot.
+    store.signed_get_url("other", ttl).await.unwrap().unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    store
+        .signed_get_url("other", std::time::Duration::from_hours(2))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    for ttl in [
+        std::time::Duration::ZERO,
+        std::time::Duration::from_hours(8 * 24),
+    ] {
+        assert!(matches!(
+            store.signed_get_url("other", ttl).await.unwrap_err(),
+            StoreError::InvalidArgument(_)
+        ));
+    }
+    assert_eq!(calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn signing_is_off_under_sas_auth_or_without_an_account() {
+    let (store, calls) = fixture(|_| async { panic!("no request expected") }, None);
+    assert!(
+        store
+            .signed_get_url("key", std::time::Duration::from_mins(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let cfg = StoreConfig {
+        bucket: "container".into(),
+        azure: walgit_config::AzureConfig {
+            endpoint: "https://blobs.example.test".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let store = AzureStore::with_client_options(
+        &cfg,
+        container_url(&cfg, None).unwrap(),
+        Some(Arc::new(FixedCredential)),
+        ClientOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        store.signing.is_none(),
+        "a custom endpoint hides the account name"
+    );
+    assert!(calls.lock().unwrap().is_empty());
 }

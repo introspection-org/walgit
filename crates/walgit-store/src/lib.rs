@@ -18,9 +18,9 @@ use tracing::Instrument;
 
 pub mod coord;
 pub use coord::CoordError;
-pub mod fault;
 #[cfg(feature = "azure")]
 pub mod azure;
+pub mod fault;
 #[cfg(feature = "gcs")]
 pub mod gcs;
 pub mod memory;

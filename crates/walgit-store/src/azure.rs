@@ -4,6 +4,8 @@
 //! partitions even a single requested range. Those two operations use the same
 //! SDK HTTP pipeline directly; all authentication, retry and transport remain
 //! SDK-owned. PUTs publish once, after uniquely named blocks have been staged.
+//! Signed URLs are user-delegation SAS: HMAC over a cached key the account
+//! issues to this identity, so walgit never holds a shared key.
 
 use std::num::NonZero;
 use std::sync::Arc;
@@ -16,6 +18,7 @@ use azure_core::http::policies::auth::{Authorizer, BearerTokenAuthorizationPolic
 use azure_core::http::{
     ClientMethodOptions, ClientOptions, Context, Etag, Method, Pipeline, Request, StatusCode,
 };
+use azure_core::time::{Duration, OffsetDateTime};
 use azure_storage_blob::models::{
     BlobClientDeleteOptions, BlobClientGetPropertiesResultHeaders,
     BlobContainerClientListBlobsOptions, BlockBlobClientCommitBlockListOptions,
@@ -25,9 +28,12 @@ use azure_storage_blob::models::{
 use azure_storage_blob::{
     BlobClient, BlobContainerClient, BlobContainerClientOptions, BlockBlobClient,
 };
+use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
+use sha2::Sha256;
 use url::Url;
 use uuid::Uuid;
 use walgit_config::{AzureCredential, StoreConfig};
@@ -46,13 +52,58 @@ const AZURE_API_VERSION: &str = "2026-04-06";
 const STORAGE_SCOPE: &str = "https://storage.azure.com/.default";
 const CONTENT_RANGE: HeaderName = HeaderName::from_static("content-range");
 const COPY_SOURCE: HeaderName = HeaderName::from_static("x-ms-copy-source");
+// The SAS layout this module signs. Newer service versions add fields to the
+// string-to-sign; the signed `sv` pins which layout the service verifies.
+const SAS_VERSION: &str = "2020-12-06";
+const SAS_CLOCK_SKEW: Duration = Duration::minutes(5);
+const DELEGATION_KEY_LIFETIME: Duration = Duration::hours(24);
+// The service refuses a user delegation key valid for longer than seven days.
+const DELEGATION_KEY_MAX_LIFETIME: Duration = Duration::days(7);
 
 pub struct AzureStore {
     container: Arc<BlobContainerClient>,
     pipeline: Pipeline,
+    /// `None` under SAS authentication (a user delegation key needs an Entra
+    /// identity, and the configured SAS may grant more than a read) or when
+    /// no account name is known for the canonical resource.
+    signing: Option<Signing>,
+    delegation_key: parking_lot::Mutex<Option<Arc<CachedDelegationKey>>>,
     multipart_threshold: u64,
     multipart_part_size: usize,
     max_concurrent_blocks: usize,
+}
+
+struct Signing {
+    account: String,
+    container: String,
+    /// `{endpoint}` without the container segment: where the delegation key is requested.
+    service_url: Url,
+}
+
+/// A user delegation key as the service returned it, every field verbatim so
+/// the string-to-sign carries exactly what the service will recompute.
+#[derive(Deserialize)]
+struct DelegationKey {
+    #[serde(rename = "SignedOid")]
+    oid: String,
+    #[serde(rename = "SignedTid")]
+    tid: String,
+    #[serde(rename = "SignedStart")]
+    start: String,
+    #[serde(rename = "SignedExpiry")]
+    expiry: String,
+    #[serde(rename = "SignedService")]
+    service: String,
+    #[serde(rename = "SignedVersion")]
+    version: String,
+    /// Base64 key material. Never logged, never in an error.
+    #[serde(rename = "Value")]
+    value: String,
+}
+
+struct CachedDelegationKey {
+    key: DelegationKey,
+    expires_at: OffsetDateTime,
 }
 
 impl AzureStore {
@@ -104,6 +155,11 @@ impl AzureStore {
                 })),
             ));
         }
+        let signing = if credential.is_some() {
+            signing_target(cfg, &url)?
+        } else {
+            None
+        };
         if let Some(credential) = credential {
             // One authorizer/cache supplies both headers on each retry of a
             // server-side copy. A private source does not inherit destination auth.
@@ -131,6 +187,8 @@ impl AzureStore {
         Ok(Self {
             container: Arc::new(container),
             pipeline,
+            signing,
+            delegation_key: parking_lot::Mutex::new(None),
             multipart_threshold: cfg.multipart_threshold.as_u64(),
             multipart_part_size: usize::try_from(cfg.multipart_part_size.as_u64())?,
             max_concurrent_blocks: cfg.azure.max_concurrent_blocks,
@@ -185,6 +243,25 @@ fn container_url(cfg: &StoreConfig, sas: Option<&str>) -> anyhow::Result<Url> {
         url.set_query(Some(sas.trim_start_matches('?')));
     }
     Ok(url)
+}
+
+/// The account and service URL a signed URL is computed against. The canonical
+/// resource names the account, which a custom `endpoint` does not reveal, so
+/// signing is off until `store.azure.account` is set alongside one.
+fn signing_target(cfg: &StoreConfig, container_url: &Url) -> anyhow::Result<Option<Signing>> {
+    if cfg.azure.account.is_empty() {
+        return Ok(None);
+    }
+    let mut service_url = container_url.clone();
+    service_url
+        .path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("azure: invalid endpoint path"))?
+        .pop();
+    Ok(Some(Signing {
+        account: cfg.azure.account.clone(),
+        container: cfg.bucket.clone(),
+        service_url,
+    }))
 }
 
 fn credential(kind: AzureCredential) -> anyhow::Result<Arc<dyn TokenCredential>> {
@@ -267,6 +344,14 @@ fn map_error(key: &str, error: &azure_core::Error) -> StoreError {
             key: key.into(),
             current: None,
         },
+        // Transient container state; other 409 codes (lease, snapshot) are real faults.
+        ErrorKind::HttpResponse {
+            status: StatusCode::Conflict,
+            error_code: Some(code),
+            ..
+        } if code == "ContainerBeingDeleted" => StoreError::retryable(anyhow::anyhow!(
+            "azure: {key}: HTTP 409 (ContainerBeingDeleted)"
+        )),
         ErrorKind::HttpResponse {
             status, error_code, ..
         } => {
@@ -383,34 +468,34 @@ impl ObjectStore for AzureStore {
     }
 
     async fn put(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
+        // Every body at or below the threshold is one request: a pack push is a
+        // `File`, and staging it would pay a block plus a commit for a few KiB.
+        let small = |len: u64| len <= self.multipart_threshold;
         match body {
-            PutBody::Bytes(bytes) if bytes.len() as u64 <= self.multipart_threshold => {
-                let len = bytes.len() as u64;
-                let options = BlockBlobClientUploadOptions {
-                    if_match: match &opts.mode {
-                        PutMode::Update(v) => Some(etag(v)),
-                        _ => None,
-                    },
-                    if_none_match: matches!(opts.mode, PutMode::Create).then(|| Etag::from("*")),
-                    blob_content_type: opts.content_type.map(Into::into),
-                    blob_cache_control: opts
-                        .immutable
-                        .then(|| "public, max-age=31536000, immutable".into()),
-                    // Prevent the SDK from starting a second managed multipart upload.
-                    partition_size: NonZero::new(len.max(1)),
-                    ..Default::default()
-                };
-                let result = self
-                    .blob(key)
-                    .block_blob_client()
-                    .upload(bytes.into(), Some(options))
+            PutBody::Bytes(bytes) if small(bytes.len() as u64) => {
+                self.put_single(key, bytes, &opts).await
+            }
+            PutBody::Stream { len, stream } if small(len) => {
+                let bytes =
+                    util::collect(stream, usize::try_from(len).map_err(StoreError::other)?).await?;
+                if bytes.len() as u64 != len {
+                    return Err(StoreError::InvalidArgument(
+                        "azure: upload stream length differs from declared length".into(),
+                    ));
+                }
+                self.put_single(key, bytes, &opts).await
+            }
+            PutBody::File(path) => {
+                let len = tokio::fs::metadata(&path)
                     .await
-                    .map_err(|e| map_error(key, &e))?;
-                Ok(ObjectMeta {
-                    key: key.into(),
-                    size: len,
-                    version: version_of(result.etag)?,
-                })
+                    .map_err(StoreError::other)?
+                    .len();
+                if small(len) {
+                    let bytes = tokio::fs::read(&path).await.map_err(StoreError::other)?;
+                    self.put_single(key, Bytes::from(bytes), &opts).await
+                } else {
+                    self.put_staged(key, PutBody::File(path), opts).await
+                }
             }
             other => self.put_staged(key, other, opts).await,
         }
@@ -588,9 +673,105 @@ impl ObjectStore for AzureStore {
         }
         self.commit(dest, &block, blocks, total, &opts).await
     }
+
+    /// A read-only user-delegation SAS URL: signed with a key the account
+    /// issues to this identity, never with a shared key walgit does not hold.
+    /// The returned string is a credential for that one blob until `ttl` passes.
+    async fn signed_get_url(&self, key: &str, ttl: std::time::Duration) -> Result<Option<String>> {
+        let Some(signing) = &self.signing else {
+            return Ok(None);
+        };
+        let ttl = Duration::try_from(ttl).map_err(|_| {
+            StoreError::InvalidArgument("azure: signed URL ttl out of range".into())
+        })?;
+        if ttl <= Duration::ZERO || ttl.saturating_add(SAS_CLOCK_SKEW) > DELEGATION_KEY_MAX_LIFETIME
+        {
+            return Err(StoreError::InvalidArgument(
+                "azure: signed URL ttl must be positive and under seven days".into(),
+            ));
+        }
+        let now = OffsetDateTime::now_utc();
+        let expiry = now.saturating_add(ttl);
+        let delegation = &self.delegation_key(key, now, expiry).await?.key;
+        let sas = Sas {
+            permissions: "r",
+            start: sas_time(now.saturating_sub(SAS_CLOCK_SKEW)),
+            expiry: sas_time(expiry),
+            resource: format!("/blob/{}/{}/{key}", signing.account, signing.container),
+            protocol: "https",
+            resource_type: "b",
+        };
+        let signature = sas.sign(delegation)?;
+        let mut url = self.blob(key).url().clone();
+        {
+            let mut q = url.query_pairs_mut();
+            q.clear()
+                .append_pair("sv", SAS_VERSION)
+                .append_pair("spr", sas.protocol)
+                .append_pair("st", &sas.start)
+                .append_pair("se", &sas.expiry)
+                .append_pair("sr", sas.resource_type)
+                .append_pair("sp", sas.permissions)
+                .append_pair("skoid", &delegation.oid)
+                .append_pair("sktid", &delegation.tid)
+                .append_pair("skt", &delegation.start)
+                .append_pair("ske", &delegation.expiry)
+                .append_pair("sks", &delegation.service)
+                .append_pair("skv", &delegation.version)
+                .append_pair("sig", &signature);
+        }
+        Ok(Some(url.into()))
+    }
 }
 
 impl AzureStore {
+    /// A delegation key covering a URL that expires at `until`: the cached one
+    /// when it still reaches, else one request for a fresh key. Racing callers
+    /// may both fetch; either key verifies, and the lock is never held across
+    /// the round trip.
+    async fn delegation_key(
+        &self,
+        key: &str,
+        now: OffsetDateTime,
+        until: OffsetDateTime,
+    ) -> Result<Arc<CachedDelegationKey>> {
+        if let Some(cached) = self.delegation_key.lock().clone()
+            && cached.expires_at >= until
+        {
+            return Ok(cached);
+        }
+        let Some(signing) = &self.signing else {
+            return Err(StoreError::other(anyhow::anyhow!(
+                "azure: signing unavailable"
+            )));
+        };
+        let expires_at = now.saturating_add(DELEGATION_KEY_LIFETIME).max(until);
+        let mut url = signing.service_url.clone();
+        url.query_pairs_mut()
+            .append_pair("restype", "service")
+            .append_pair("comp", "userdelegationkey");
+        let mut request = Request::new(url, Method::Post);
+        request.insert_header("x-ms-version", AZURE_API_VERSION);
+        request.insert_header("content-type", "application/xml");
+        request.set_body(Bytes::from(format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><KeyInfo><Start>{}</Start><Expiry>{}</Expiry></KeyInfo>",
+            sas_time(now.saturating_sub(SAS_CLOCK_SKEW)),
+            sas_time(expires_at)
+        )));
+        let response = self
+            .pipeline
+            .send(&Context::new(), &mut request, None)
+            .await
+            .map_err(|e| map_error(key, &e))?;
+        let key: DelegationKey = quick_xml::de::from_reader(&*response.into_body())
+            .map_err(|_| StoreError::other(anyhow::anyhow!("azure: malformed delegation key")))?;
+        let expires_at = azure_core::time::parse_rfc3339(&key.expiry)
+            .map_err(|_| StoreError::other(anyhow::anyhow!("azure: malformed delegation key")))?;
+        let cached = Arc::new(CachedDelegationKey { key, expires_at });
+        *self.delegation_key.lock() = Some(cached.clone());
+        Ok(cached)
+    }
+
     async fn list_delimited(
         &self,
         prefix: &str,
@@ -686,6 +867,35 @@ impl AzureStore {
         .await
     }
 
+    async fn put_single(&self, key: &str, bytes: Bytes, opts: &PutOptions) -> Result<ObjectMeta> {
+        let len = bytes.len() as u64;
+        let options = BlockBlobClientUploadOptions {
+            if_match: match &opts.mode {
+                PutMode::Update(v) => Some(etag(v)),
+                _ => None,
+            },
+            if_none_match: matches!(opts.mode, PutMode::Create).then(|| Etag::from("*")),
+            blob_content_type: opts.content_type.map(Into::into),
+            blob_cache_control: opts
+                .immutable
+                .then(|| "public, max-age=31536000, immutable".into()),
+            // Prevent the SDK from starting a second managed multipart upload.
+            partition_size: NonZero::new(len.max(1)),
+            ..Default::default()
+        };
+        let result = self
+            .blob(key)
+            .block_blob_client()
+            .upload(bytes.into(), Some(options))
+            .await
+            .map_err(|e| map_error(key, &e))?;
+        Ok(ObjectMeta {
+            key: key.into(),
+            size: len,
+            version: version_of(result.etag)?,
+        })
+    }
+
     async fn commit(
         &self,
         key: &str,
@@ -755,6 +965,74 @@ struct DelimitedBlobs {
 struct BlobPrefix {
     #[serde(rename = "Name")]
     name: String,
+}
+
+/// The signed fields of one blob-scoped user delegation SAS.
+struct Sas {
+    permissions: &'static str,
+    start: String,
+    expiry: String,
+    resource: String,
+    protocol: &'static str,
+    resource_type: &'static str,
+}
+
+impl Sas {
+    /// The `sv = 2020-12-06` string-to-sign: unset optional fields stay as
+    /// empty lines, and the key's own fields are the service's verbatim strings.
+    fn string_to_sign(&self, key: &DelegationKey) -> String {
+        [
+            self.permissions,
+            &self.start,
+            &self.expiry,
+            &self.resource,
+            &key.oid,
+            &key.tid,
+            &key.start,
+            &key.expiry,
+            &key.service,
+            &key.version,
+            "", // signedAuthorizedUserObjectId
+            "", // signedUnauthorizedUserObjectId
+            "", // signedCorrelationId
+            "", // signedIP
+            self.protocol,
+            SAS_VERSION,
+            self.resource_type,
+            "", // signedSnapshotTime
+            "", // signedEncryptionScope
+            "", // rscc
+            "", // rscd
+            "", // rsce
+            "", // rscl
+            "", // rsct
+        ]
+        .join("\n")
+    }
+
+    fn sign(&self, key: &DelegationKey) -> Result<String> {
+        let engine = base64::engine::general_purpose::STANDARD;
+        let secret = engine
+            .decode(&key.value)
+            .map_err(|_| StoreError::other(anyhow::anyhow!("azure: malformed delegation key")))?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&secret)
+            .map_err(|_| StoreError::other(anyhow::anyhow!("azure: malformed delegation key")))?;
+        mac.update(self.string_to_sign(key).as_bytes());
+        Ok(engine.encode(mac.finalize().into_bytes()))
+    }
+}
+
+/// `YYYY-MM-DDThh:mm:ssZ`, the only form a SAS accepts; `t` is UTC.
+fn sas_time(t: OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
 }
 
 fn parse_blob_prefixes(body: &[u8]) -> anyhow::Result<(Vec<String>, Option<String>)> {

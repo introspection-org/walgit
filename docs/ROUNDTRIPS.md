@@ -55,7 +55,7 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Azure compose | per source: HEAD → parallel source-version-pinned copy ranges; then one destination commit | sources + copy blocks + 1; empty compose: 1 PUT | `azure.rs::compose` |
 | Azure conditional DELETE returning 412 (failure only) | DELETE → HEAD distinguishes absent from stale version | 2; successful DELETE stays 1 | `azure.rs::delete` |
 | Azure listing | one paged LIST per page, delimiter handled server-side for prefixes | pages only; never enumerate descendants to derive directories | `azure.rs::list`, `list_prefixes` |
-| Azure signed URL (`serve_via = "signed_url"`) | HMAC over a cached user delegation key; one `Get User Delegation Key` POST when no cached key reaches the URL's expiry (24 h lifetime) | 0 per URL; 1 per key | `azure.rs::signed_get_url`, `delegation_key` |
+| Azure signed URL (`serve_via = "signed_url"`, and `accel_target` for an nginx edge) | HMAC over a cached user delegation key; one `Get User Delegation Key` POST when no cached key reaches the URL's expiry (24 h lifetime) | 0 per URL; 1 per key | `azure.rs::signed_get_url`, `delegation_key` |
 | Orphan log slot (failure path only) | +1 fresh manifest GET, +HEAD per probe, +Create at next seq | — | `publish.rs::claim_log_slot` |
 
 `healthy_request_round_trip_budgets` in `crates/walgit-server/tests/sim.rs` pins the healthy MemoryStore

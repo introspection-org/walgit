@@ -814,3 +814,31 @@ fn a_service_principal_without_its_variables_is_named_not_guessed() {
     let error = credential(AzureCredential::ClientSecret).unwrap_err();
     assert_eq!(error.to_string(), "azure: AZURE_TENANT_ID is not set");
 }
+
+#[tokio::test]
+async fn the_edge_gets_a_credentialed_url_and_no_header_under_either_auth() {
+    let key_expiry = sas_time(OffsetDateTime::now_utc() + Duration::hours(2));
+    let (store, _) = fixture(
+        move |_| {
+            let body = delegation_key_xml(&key_expiry);
+            async move { Ok(response(StatusCode::Ok, body, &[])) }
+        },
+        Some(Arc::new(FixedCredential)),
+    );
+    let target = store.accel_target("repos/o/r/bundle").await.unwrap();
+    assert!(target.authorization.is_none());
+    let url = Url::parse(&target.url).unwrap();
+    assert_eq!(url.path(), "/container/repos%2Fo%2Fr%2Fbundle");
+    let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(q["sp"], "r");
+    assert!(q.contains_key("sig"));
+
+    let (store, calls) = fixture(|_| async { panic!("no request expected") }, None);
+    let target = store.accel_target("repos/o/r/bundle").await.unwrap();
+    assert!(target.authorization.is_none());
+    assert_eq!(
+        target.url,
+        "https://account.blob.core.windows.net/container/repos%2Fo%2Fr%2Fbundle?sig=synthetic-sas"
+    );
+    assert!(calls.lock().unwrap().is_empty());
+}

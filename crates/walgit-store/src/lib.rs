@@ -245,6 +245,7 @@ pub trait ObjectStore: Send + Sync + 'static {
     /// a URL it can `proxy_pass`, and the `Authorization` value to send with it, if any.
     /// GCS: the path-style URL + this process's bearer token (no token on the edge, nothing to
     /// refresh). S3: a presigned GET URL (`Range` is not a signed header, so the edge may slice).
+    /// Azure: a one-hour read SAS under identity auth, the configured SAS otherwise.
     /// Backends without one return `None` and the bytes stream through walgit.
     async fn accel_target(&self, _key: &str) -> Option<AccelTarget> {
         None

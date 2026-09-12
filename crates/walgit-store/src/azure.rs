@@ -68,6 +68,8 @@ pub struct AzureStore {
     /// no account name is known for the canonical resource.
     signing: Option<Signing>,
     delegation_key: parking_lot::Mutex<Option<Arc<CachedDelegationKey>>>,
+    /// The container URL carries the configured SAS instead of a credential.
+    sas_auth: bool,
     multipart_threshold: u64,
     multipart_part_size: usize,
     max_concurrent_blocks: usize,
@@ -155,10 +157,11 @@ impl AzureStore {
                 })),
             ));
         }
-        let signing = if credential.is_some() {
-            signing_target(cfg, &url)?
-        } else {
+        let sas_auth = credential.is_none();
+        let signing = if sas_auth {
             None
+        } else {
+            signing_target(cfg, &url)?
         };
         if let Some(credential) = credential {
             // One authorizer/cache supplies both headers on each retry of a
@@ -189,6 +192,7 @@ impl AzureStore {
             pipeline,
             signing,
             delegation_key: parking_lot::Mutex::new(None),
+            sas_auth,
             multipart_threshold: cfg.multipart_threshold.as_u64(),
             multipart_part_size: usize::try_from(cfg.multipart_part_size.as_u64())?,
             max_concurrent_blocks: cfg.azure.max_concurrent_blocks,
@@ -733,6 +737,25 @@ impl ObjectStore for AzureStore {
                 .append_pair("sig", &signature);
         }
         Ok(Some(url.into()))
+    }
+
+    /// Under identity auth a one-hour read SAS, as S3 hands the edge a presigned
+    /// URL; under SAS auth the blob URL already carries the configured token,
+    /// which a trusted edge may hold as GCS's edge holds this process's bearer.
+    /// `Range` is not a signed header either way, so the edge may slice.
+    async fn accel_target(&self, key: &str) -> Option<crate::AccelTarget> {
+        let url = if self.sas_auth {
+            self.blob(key).url().to_string()
+        } else {
+            self.signed_get_url(key, std::time::Duration::from_hours(1))
+                .await
+                .ok()
+                .flatten()?
+        };
+        Some(crate::AccelTarget {
+            url,
+            authorization: None,
+        })
     }
 }
 

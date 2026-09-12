@@ -96,8 +96,9 @@ credential = "auto"              # workload identity when AZURE_FEDERATED_TOKEN_
 sas_token_env = "AZURE_STORAGE_SAS_TOKEN" # optional override for emulator tests; unset in identity-based deployments
 max_concurrent_blocks = 8        # upload memory bounded by concurrency × multipart_part_size + one input chunk
 # multipart_part_size must be 1 byte..4000 MiB; uploads may contain at most 50,000 blocks.
-# bundles/lfs serve_via = "signed_url" mints read-only user-delegation SAS URLs under identity auth; the identity needs
-# "Storage Blob Delegator" on the account, and a custom endpoint needs account set too. SAS-token auth serves via proxy.
+# bundles/lfs serve_via = "signed_url" and edge offload (server.accel_redirect) use read-only user-delegation SAS URLs
+# under identity auth: the identity needs "Storage Blob Delegator" on the account, and a custom endpoint needs account
+# set too. SAS-token auth serves bundles/lfs via proxy and hands the edge the configured SAS.
 
 [cache]
 dir = "/tmp/walgit"               # local materialized repos (+ tls/ for a self-signed certificate)

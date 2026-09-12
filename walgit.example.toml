@@ -90,7 +90,8 @@ bulk_concurrency = 32             # max concurrent bulk requests per process (co
 account = ""                    # derives https://<account>.blob.core.windows.net
 endpoint = ""                   # optional override, e.g. http://127.0.0.1:10000/devstoreaccount1
 credential = "auto"              # workload identity when AZURE_FEDERATED_TOKEN_FILE is set, otherwise managed identity
-                                # or "workload_identity", "managed_identity", "azure_cli" (explicit local az login)
+                                # or "workload_identity", "managed_identity", "azure_cli" (explicit local az login),
+                                # "client_secret" (AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET)
                                 # managed identity honors AZURE_CLIENT_ID for a user-assigned identity
 sas_token_env = "AZURE_STORAGE_SAS_TOKEN" # optional override for emulator tests; unset in identity-based deployments
 max_concurrent_blocks = 8        # upload memory bounded by concurrency × multipart_part_size + one input chunk

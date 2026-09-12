@@ -284,6 +284,18 @@ fn credential(kind: AzureCredential) -> anyhow::Result<Arc<dyn TokenCredential>>
             ))?)
         }
         AzureCredential::AzureCli => Ok(azure_identity::AzureCliCredential::new(None)?),
+        AzureCredential::ClientSecret => {
+            // Named, never echoed: a missing variable is reported by name only.
+            let var = |name: &str| {
+                std::env::var(name).map_err(|_| anyhow::anyhow!("azure: {name} is not set"))
+            };
+            Ok(azure_identity::ClientSecretCredential::new(
+                &var("AZURE_TENANT_ID")?,
+                var("AZURE_CLIENT_ID")?,
+                var("AZURE_CLIENT_SECRET")?.into(),
+                None,
+            )?)
+        }
     }
 }
 

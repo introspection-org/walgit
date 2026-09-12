@@ -803,3 +803,14 @@ async fn signing_is_off_under_sas_auth_or_without_an_account() {
     );
     assert!(calls.lock().unwrap().is_empty());
 }
+
+#[test]
+fn a_service_principal_without_its_variables_is_named_not_guessed() {
+    // The harness clears no environment, so only the unset case is portable;
+    // a set variable would leak between parallel tests.
+    if std::env::var_os("AZURE_TENANT_ID").is_some() {
+        return;
+    }
+    let error = credential(AzureCredential::ClientSecret).unwrap_err();
+    assert_eq!(error.to_string(), "azure: AZURE_TENANT_ID is not set");
+}

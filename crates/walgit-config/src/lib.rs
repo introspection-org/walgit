@@ -312,6 +312,9 @@ pub enum AzureCredential {
     ManagedIdentity,
     /// Opt-in local development using `az login`.
     AzureCli,
+    /// A service principal from `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and
+    /// `AZURE_CLIENT_SECRET`, for hosts with no managed or workload identity.
+    ClientSecret,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

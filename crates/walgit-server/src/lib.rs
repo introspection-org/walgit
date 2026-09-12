@@ -43,6 +43,8 @@ pub mod health;
 pub mod instance;
 pub mod lfs;
 pub mod lfs_upstream;
+#[cfg(feature = "lfs-xet")]
+pub mod lfs_xet;
 pub mod maintain;
 pub mod metrics;
 pub mod middleware;

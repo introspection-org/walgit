@@ -105,7 +105,7 @@ max_bytes = "128MiB"
 ''')
         def git(*args, cwd=directory):
             return run(["git", "-c", "user.name=Azure Test", "-c", "user.email=azure-test@example.invalid",
-                        "-c", "transfer.bundleURI=false", *args], env=env, cwd=cwd, timeout=90)
+                        *args], env=env, cwd=cwd, timeout=90)
         source = directory / "source"
         git("init", "-b", "main", str(source))
         payload = os.urandom(2 * 1024 * 1024 + 17)

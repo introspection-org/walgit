@@ -788,7 +788,7 @@ async fn azure_contract() {
         .expect("empty compose");
     assert_eq!(empty.size, 0);
     // Under SAS-token auth (the emulator path) no user delegation key exists to
-    // sign with, so bundle and LFS URLs fall back to the proxy.
+    // sign with, so LFS URLs fall back to the proxy.
     assert!(
         store
             .signed_get_url(&key, std::time::Duration::from_mins(1))

@@ -102,8 +102,6 @@ endpoint = "{endpoint}"
 dir = "{cache}"
 mode = "budget"
 max_bytes = "128MiB"
-[bundles]
-enabled = false
 ''')
         def git(*args, cwd=directory):
             return run(["git", "-c", "user.name=Azure Test", "-c", "user.email=azure-test@example.invalid",
